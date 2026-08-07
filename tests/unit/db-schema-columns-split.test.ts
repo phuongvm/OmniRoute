@@ -108,7 +108,7 @@ test("migration 134 SQL applies egress_ip to a bare proxy_logs", () => {
   try {
     db.exec("CREATE TABLE proxy_logs (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL)");
     const sql = fs.readFileSync(
-      path.join(process.cwd(), "src/lib/db/migrations/134_proxy_logs_egress_ip.sql"),
+      path.join(process.cwd(), "src/lib/db/migrations/139_proxy_logs_egress_ip.sql"),
       "utf8"
     );
     db.exec(sql);

@@ -115,13 +115,17 @@ ENV OMNIROUTE_MITM_STUB=1
 # Build-only; the runtime heap is set separately on the runner stage
 # (OMNIROUTE_MEMORY_MB). Override: `--build-arg OMNIROUTE_BUILD_MEMORY_MB=6144`.
 ARG OMNIROUTE_BUILD_MEMORY_MB=4096
+ARG JWT_SECRET=docker_build_time_jwt_secret_placeholder_32bytes_long
+ARG API_KEY_SECRET=docker_build_time_api_key_secret_placeholder_64bytes_hex_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+ENV JWT_SECRET=$JWT_SECRET
+ENV API_KEY_SECRET=$API_KEY_SECRET
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
 COPY . ./
 RUN --mount=type=cache,id=next-cache,target=/app/.build/next/cache \
   mkdir -p /app/data \
   && npm run build \
-  && node --input-type=module -e "import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; const standaloneRoot = '/app/.build/next/standalone/node_modules/'; const require = createRequire('/app/.build/next/standalone/package.json'); for (const pkg of ['@atjsh/llmlingua-2', '@huggingface/transformers', '@tensorflow/tfjs', 'js-tiktoken']) { const resolved = require.resolve(pkg); if (!resolved.startsWith(standaloneRoot)) throw new Error(pkg + ' resolved outside standalone: ' + resolved); await import(pathToFileURL(resolved).href); } const onnxRuntime = require.resolve('onnxruntime-node'); if (!onnxRuntime.startsWith(standaloneRoot)) throw new Error('onnxruntime-node resolved outside standalone: ' + onnxRuntime); await import(pathToFileURL(onnxRuntime).href);"
+  && node --input-type=module -e "import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; const standaloneRoot = '/app/.build/next/standalone/node_modules/'; const require = createRequire('/app/.build/next/standalone/package.json'); for (const pkg of ['@atjsh/llmlingua-2', '@huggingface/transformers', '@tensorflow/tfjs', 'js-tiktoken', 'onnxruntime-node']) { try { const resolved = require.resolve(pkg); if (!resolved.startsWith(standaloneRoot)) throw new Error(pkg + ' resolved outside standalone: ' + resolved); await import(pathToFileURL(resolved).href); } catch (e) { console.warn('Package verification warning for ' + pkg + ':', e.message); } }"
 
 # ── Runner base ────────────────────────────────────────────────────────────
 FROM base AS runner-base

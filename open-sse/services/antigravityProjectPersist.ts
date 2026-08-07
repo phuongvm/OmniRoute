@@ -40,3 +40,22 @@ export async function persistDiscoveredAntigravityProjectId(
     // Non-fatal: persistence failure must never block the in-flight request.
   }
 }
+
+/**
+ * Filter or prioritize connections that have a valid stored projectId.
+ */
+export function preferAntigravityConnectionsWithStoredProject(
+  connections: Array<Record<string, unknown>>
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(connections) || connections.length === 0) {
+    return connections;
+  }
+  const withProject = connections.filter((conn) => {
+    const hasCol = typeof conn.projectId === "string" && conn.projectId.trim().length > 0;
+    const psd = conn.providerSpecificData as Record<string, unknown> | undefined;
+    const hasPsd = typeof psd?.projectId === "string" && (psd.projectId as string).trim().length > 0;
+    return hasCol || hasPsd;
+  });
+  return withProject.length > 0 ? withProject : connections;
+}
+
