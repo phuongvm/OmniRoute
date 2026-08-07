@@ -673,10 +673,13 @@ test("chatCore builds Claude Code-compatible upstream requests for CC providers"
   });
 
   assert.equal(result.success, true);
-  assert.equal(call.headers.Accept ?? call.headers.accept, "text/event-stream");
-  assert.deepEqual([call.body.stream, call.body.context_management], [true, undefined]);
-  assert.equal(call.body.system.length, 1);
-  assert.match(call.body.system[0].text, /Claude Agent SDK/);
+  assert.equal(call.headers.Accept ?? call.headers.accept, "application/json");
+  assert.equal(call.body.stream, true);
+  assert.equal(call.body.context_management.edits[0].type, "clear_thinking_20251015");
+  assert.equal(
+    call.body.system.some((block: { text?: string }) => /Claude Agent SDK/.test(block.text || "")),
+    true
+  );
   assert.equal(typeof call.body.metadata.user_id, "string");
   assert.equal(call.body.messages[0].role, "user");
   assert.equal(call.body.messages[0].content[0].text, "Ping");
@@ -757,6 +760,60 @@ test("chatCore normalizes native Claude Code messages for native Claude OAuth pa
 
   // user msg[2] (was clientMessages[3]): tool_result preserved (preserveToolResultBlocks:true)
   assert.equal(call.body.messages[2].content[0].type, "tool_result");
+});
+
+test("chatCore preserves Opus 5 mid-conversation system cache breakpoints", async () => {
+  await settingsDb.updateSettings({ alwaysPreserveClientCache: "auto" });
+  invalidateCacheControlSettingsCache();
+
+  const { call, result } = await invokeChatCore({
+    provider: "claude",
+    model: "claude-opus-5",
+    endpoint: "/v1/messages",
+    credentials: { apiKey: "claude-key", providerSpecificData: {} },
+    body: {
+      model: "claude-opus-5",
+      max_tokens: 64,
+      system: [
+        {
+          type: "text",
+          text: "stable system prompt",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "first turn" }] },
+        { role: "assistant", content: [{ type: "text", text: "first response" }] },
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "compact continuation",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "latest turn" }] },
+      ],
+      tools: [{ name: "Bash", input_schema: { type: "object", properties: {} } }],
+    },
+    userAgent: "Claude-Code/2.1.220",
+    requestHeaders: { "x-app": "cli", "x-claude-code-session-id": "session-123" },
+    responseFormat: "claude",
+  });
+
+  assert.equal(result.success, true);
+  assert.deepEqual(
+    call.body.messages.map((message: { role: string }) => message.role),
+    ["user", "assistant", "system", "user"]
+  );
+  assert.deepEqual(call.body.messages[2].content[0].cache_control, { type: "ephemeral" });
+  assert.equal(
+    call.body.system.some((block: { text?: string }) => block.text === "compact continuation"),
+    false
+  );
+  assert.equal(call.body.messages[3].content[0].cache_control, undefined);
 });
 
 test("chatCore keeps Claude normalization for non-Claude-Code Claude passthrough", async () => {
@@ -855,10 +912,14 @@ test("chatCore normalizes native Claude Code messages before CC-compatible relay
   // After normalization: role:"system" msg extracted → top-level system (3 msgs remain, not 4)
   assert.equal(call.body.messages.length, 3);
 
-  // CC bridge prepends its own system block; extracted system block is appended after it
+  // CC bridge prepends its dynamic billing/fingerprint blocks; the SDK identity and
+  // extracted system block must both remain present regardless of their exact position.
   assert.equal(
-    call.body.system[0].text,
-    "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    call.body.system.some(
+      (block: { text?: string }) =>
+        block.text === "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    ),
+    true
   );
   assert.equal(
     call.body.system.some(
@@ -927,6 +988,52 @@ test("chatCore preserves cache_control automatically for Claude Code single-mode
   assert.deepEqual(call.body.system[2].cache_control, { type: "ephemeral", ttl: "5m" });
   assert.deepEqual(call.body.messages[0].content[0].cache_control, { type: "ephemeral" });
   // base.ts executor explicitly strips cache_control from tools for Claude Code clients
+  assert.equal(call.body.tools[0].cache_control, undefined);
+});
+
+test("chatCore supplements a missing message cache breakpoint for native Claude Code requests", async () => {
+  await settingsDb.updateSettings({ alwaysPreserveClientCache: "auto" });
+  invalidateCacheControlSettingsCache();
+
+  const { call } = await invokeChatCore({
+    provider: "claude",
+    model: "claude-sonnet-4-6",
+    endpoint: "/v1/messages",
+    credentials: { apiKey: "claude-key", providerSpecificData: {} },
+    body: {
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      system: [
+        {
+          type: "text",
+          text: "stable system prompt",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+        {
+          type: "text",
+          text: "stable project instructions",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "first turn" }] },
+        { role: "assistant", content: [{ type: "text", text: "first response" }] },
+        { role: "user", content: [{ type: "text", text: "latest turn" }] },
+      ],
+      tools: [
+        {
+          name: "lookup_weather",
+          description: "Fetch weather",
+          input_schema: { type: "object" },
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+    },
+    userAgent: "Claude-Code/1.0.0",
+    responseFormat: "claude",
+  });
+
+  assert.deepEqual(call.body.messages[2].content[0].cache_control, { type: "ephemeral" });
   assert.equal(call.body.tools[0].cache_control, undefined);
 });
 
