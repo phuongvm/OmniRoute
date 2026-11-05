@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createProviderConnection } from "@/lib/db/providers";
 import {
+  classifyModelTestOutput,
+  createModelTestTimeoutError,
   parseRetryAfterHeader,
   detectTestKind,
   extractProviderErrorMessage,
@@ -10,6 +12,13 @@ import {
   resolveModelTestTimeoutMs,
   classifyTestErrorQuota,
 } from "@/lib/api/modelTestRunner.ts";
+import Bottleneck from "bottleneck";
+import * as rateLimitManager from "@omniroute/open-sse/services/rateLimitManager.ts";
+import {
+  markLocalRateLimitError,
+  RATE_LIMIT_EXECUTION_TIMEOUT_CODE,
+  RATE_LIMIT_QUEUE_WEDGED_CODE,
+} from "@omniroute/open-sse/services/rateLimitManager/errors.ts";
 
 // ---------------------------------------------------------------------------
 // parseRetryAfterHeader — Retry-After is either delta-seconds or an HTTP-date.
@@ -65,6 +74,9 @@ test("detectTestKind defaults to a plain chat test for ordinary models", () => {
     isRerank: false,
     isEmbedding: false,
     isAudioTranscription: false,
+    isAudioSpeech: false,
+    isResponses: false,
+    isNonChatGeneration: false,
   });
 });
 
@@ -86,6 +98,9 @@ test("detectTestKind detects rerank by id and by metadata, and rerank wins over 
     isRerank: true,
     isEmbedding: false,
     isAudioTranscription: false,
+    isAudioSpeech: false,
+    isResponses: false,
+    isNonChatGeneration: false,
   });
   // apiFormat metadata drives detection even when the id is opaque
   assert.equal(detectTestKind("vendor/opaque-model", { apiFormat: "rerank" }).isRerank, true);
@@ -107,6 +122,9 @@ test("detectTestKind detects audio transcription from metadata, and it wins over
     isRerank: false,
     isEmbedding: false,
     isAudioTranscription: true,
+    isAudioSpeech: false,
+    isResponses: false,
+    isNonChatGeneration: false,
   });
   assert.equal(
     detectTestKind("vendor/opaque-model", { supportedEndpoints: ["audio-transcriptions"] })
@@ -143,6 +161,9 @@ test("detectTestKind falls back to the provider node's configured apiType", () =
     isRerank: false,
     isEmbedding: false,
     isAudioTranscription: false,
+    isAudioSpeech: false,
+    isResponses: false,
+    isNonChatGeneration: false,
   });
 
   // Per-model metadata still wins when present.
@@ -285,23 +306,63 @@ test("runSingleModelTest preserves slow timeout after chatCore converts AbortErr
   }
 });
 
-test("resolveModelTestTimeoutMs defaults ordinary model checks to 30 seconds", () => {
-  assert.equal(resolveModelTestTimeoutMs("github-models", "openai/gpt-4.1"), 30_000);
+test("classifyModelTestOutput never treats partial text from an aborted stream as success", () => {
+  assert.equal(classifyModelTestOutput(true, "partial", false), "timeout");
+  assert.equal(classifyModelTestOutput(false, "complete", false), "ok");
+  assert.equal(classifyModelTestOutput(false, "", false), "empty");
+  assert.equal(classifyModelTestOutput(false, "", true), "ok");
 });
 
-test("resolveModelTestTimeoutMs gives GitHub Phi-4 Reasoning up to 60 seconds", () => {
+test("createModelTestTimeoutError distinguishes test deadlines from client aborts", () => {
+  const error = createModelTestTimeoutError(60_000);
+
+  assert.equal(error.name, "TimeoutError");
+  assert.equal(error.message, "Model test deadline exceeded after 60000ms");
+});
+
+test("resolveModelTestTimeoutMs defaults ordinary model checks to 30 seconds", () => {
+  assert.equal(resolveModelTestTimeoutMs("openai", "gpt-4.1"), 30_000);
+});
+
+test("resolveModelTestTimeoutMs gives zai-web checks up to 60 seconds", () => {
+  assert.equal(resolveModelTestTimeoutMs("zai-web", "glm-5.2", 30_000), 60_000);
+  assert.equal(resolveModelTestTimeoutMs("zai-web", "zai-web/glm-5.3-flash", 90_000), 90_000);
+});
+
+test("resolveModelTestTimeoutMs applies a 60-second minimum to Xiaomi MiMo Token Plan checks", () => {
   assert.equal(
-    resolveModelTestTimeoutMs("github-models", "microsoft/phi-4-reasoning", 30_000),
+    resolveModelTestTimeoutMs("xiaomi-mimo-token-plan", "mimo-v2.6-flash", 30_000),
     60_000
   );
+  assert.equal(resolveModelTestTimeoutMs("xiaomi-mimo", "mimo-v2.6-flash", 30_000), 30_000);
   assert.equal(
-    resolveModelTestTimeoutMs("github-models", "github-models/microsoft/phi-4-reasoning", 30_000),
-    60_000
-  );
-  assert.equal(
-    resolveModelTestTimeoutMs("github-models", "microsoft/phi-4-reasoning", 90_000),
+    resolveModelTestTimeoutMs("xiaomi-mimo-token-plan", "mimo-v2.6-flash", 90_000),
     90_000
   );
+});
+
+test("runSingleModelTest skips web-session providers before sending a chat probe", async () => {
+  const result = await runSingleModelTest({
+    providerId: "deepseek-web",
+    modelId: "deepseek-v4-pro-think",
+  });
+
+  assert.equal(result.status, "error");
+  assert.equal(result.httpStatus, 422);
+  assert.match(result.error ?? "", /Skipped:.*web-session/i);
+});
+
+test("resolveModelTestTimeoutMs gives ChatGPT Web checks up to 90 seconds", () => {
+  assert.equal(resolveModelTestTimeoutMs("chatgpt-web", "gpt-5.6-luna-free", 30_000), 90_000);
+  assert.equal(resolveModelTestTimeoutMs("CHATGPT-WEB", "chatgpt-web/gpt-5-5", 120_000), 120_000);
+});
+
+test("ChatGPT Web Clean Room is eligible for an explicit model test", async () => {
+  const { shouldSkipWebSessionModelTest } = await import("../../src/lib/api/modelTestRunner.ts");
+
+  assert.equal(shouldSkipWebSessionModelTest("chatgpt-web"), false);
+  assert.equal(shouldSkipWebSessionModelTest(" CHATGPT-WEB "), false);
+  assert.equal(shouldSkipWebSessionModelTest("deepseek-web"), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -374,4 +435,142 @@ test("classifyTestErrorQuota: daily-quota wins over credits-exhausted (isTransie
   const result = classifyTestErrorQuota("daily quota exhausted, insufficient balance");
   assert.equal(result.isQuota, true);
   assert.equal(result.isTransient, true);
+});
+test("runSingleModelTest preserves trusted local limiter HTTP statuses", async () => {
+  const connection = await createProviderConnection({
+    provider: "openai",
+    authType: "apikey",
+    name: "model-test-local-limiter-errors",
+    apiKey: "sk-model-test-local-limiter-errors",
+    isActive: true,
+    testStatus: "active",
+  });
+
+  try {
+    for (const [code, status] of [
+      [RATE_LIMIT_QUEUE_WEDGED_CODE, 503],
+      [RATE_LIMIT_EXECUTION_TIMEOUT_CODE, 504],
+    ] as const) {
+      await rateLimitManager.__resetRateLimitManagerForTests();
+      rateLimitManager.enableRateLimitProtection(connection.id);
+      rateLimitManager.__setLimiterFactoryForTests((options) => {
+        const limiter = new Bottleneck(options);
+        Object.defineProperty(limiter, "schedule", {
+          configurable: true,
+          value: async () => {
+            throw markLocalRateLimitError(new Error(`trusted ${code}`), code);
+          },
+        });
+        return limiter;
+      });
+
+      const result = await runSingleModelTest({
+        providerId: "openai",
+        modelId: "gpt-4o",
+        connectionId: connection.id,
+        timeoutMs: 5_000,
+      });
+
+      assert.equal(result.status, "error");
+      assert.equal(result.httpStatus, status);
+      assert.equal(result.error, `Error: trusted ${code}`);
+    }
+  } finally {
+    await rateLimitManager.__resetRateLimitManagerForTests();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #13376 skip path — a non-chat generation model (image/music/video) must be
+// rejected with a real HTTP status and never dispatched as a chat completion.
+//
+// The route hands `result.httpStatus` straight to NextResponse
+// (src/app/api/models/test/route.ts). When the early return omitted it, the
+// status was `undefined`, Next fell back to 200, and a skipped test reached the
+// client as an HTTP success carrying `status: "error"` in the body.
+// ---------------------------------------------------------------------------
+
+test("#13376 a generation-only model is skipped with a 4xx and is never dispatched", async () => {
+  const { addCustomModel } = await import("@/lib/db/models");
+  await addCustomModel("openai", "image-only-13376", "Image only", "manual", "images-generations", [
+    "images",
+  ]);
+
+  const originalFetch = globalThis.fetch;
+  let dispatched = false;
+  globalThis.fetch = async () => {
+    dispatched = true;
+    throw new Error("a generation-only model must not be dispatched as a chat completion");
+  };
+
+  try {
+    const result = await runSingleModelTest({
+      providerId: "openai",
+      modelId: "image-only-13376",
+      timeoutMs: 1_000,
+    });
+
+    assert.equal(dispatched, false, "no billable generation may be triggered");
+    assert.equal(result.status, "error");
+    assert.equal(typeof result.httpStatus, "number", "the route needs a real status code");
+    assert.equal(result.httpStatus, 422);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("detectTestKind prioritizes chat/responses capability over secondary audio-transcriptions", () => {
+  const result = detectTestKind(
+    "cx/gpt-6-sol-high",
+    {
+      apiFormat: "responses",
+      supportedEndpoints: ["chat", "images", "audio-transcriptions"],
+    },
+    undefined
+  );
+  assert.equal(result.isAudioTranscription, false);
+  assert.equal(result.isRerank, false);
+  assert.equal(result.isEmbedding, false);
+});
+
+test("detectTestKind: node-level chat/responses apiType never overrides per-model or name detection", () => {
+  // The node apiType is only a fallback for models without metadata.
+  const audioOnChatNode = detectTestKind("vendor/x", { apiFormat: "audio-transcriptions" }, "chat");
+  assert.equal(audioOnChatNode.isAudioTranscription, true);
+
+  const embeddingOnChatNode = detectTestKind(
+    "vendor/x",
+    { supportedEndpoints: ["embeddings"] },
+    "chat"
+  );
+  assert.equal(embeddingOnChatNode.isEmbedding, true);
+
+  // A Responses-typed node can still host an embedding model.
+  const embeddingOnResponsesNode = detectTestKind(
+    "vendor/x",
+    { supportedEndpoints: ["embeddings"] },
+    "responses"
+  );
+  assert.equal(embeddingOnResponsesNode.isEmbedding, true);
+  assert.equal(embeddingOnResponsesNode.isResponses, false);
+
+  // Name heuristics are not neutralised by a chat-typed node.
+  assert.equal(detectTestKind("vendor/rerank-x", null, "chat").isRerank, true);
+  assert.equal(detectTestKind("vendor/text-embedding-3", null, "chat").isEmbedding, true);
+
+  // A model-level apiFormat of chat-completions does not beat a per-model audio endpoint.
+  const audioEndpointWithChatFormat = detectTestKind(
+    "vendor/x",
+    { apiFormat: "chat-completions", supportedEndpoints: ["audio-transcriptions"] },
+    "chat"
+  );
+  assert.equal(audioEndpointWithChatFormat.isAudioTranscription, true);
+
+  // Only the model's own supportedEndpoints with chat wins over audio-transcriptions.
+  const multimodal = detectTestKind(
+    "vendor/x",
+    { supportedEndpoints: ["chat", "audio-transcriptions"] },
+    undefined
+  );
+  assert.equal(multimodal.isAudioTranscription, false);
 });

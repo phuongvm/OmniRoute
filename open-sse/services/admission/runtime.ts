@@ -5,6 +5,7 @@
 
 import { AdaptiveAdmissionController } from "./controller.ts";
 import { validateConfig } from "./config.ts";
+import { resolveCostConfig } from "./cost.ts";
 import { extractAdmissionCostFeatures } from "./requestFeatures.ts";
 import {
   type AdaptiveAdmissionConfig,
@@ -19,6 +20,7 @@ import {
   type ShadowDecision,
 } from "./types.ts";
 import { buildErrorBody } from "../../utils/error.ts";
+import { getProcessStore } from "@/shared/utils/processSingleton";
 import { CORS_HEADERS } from "../../utils/cors.ts";
 import {
   checkResourcePressureGuard,
@@ -39,26 +41,17 @@ export const DEFAULT_ADAPTIVE_ADMISSION_CONFIG: Readonly<AdaptiveAdmissionConfig
   maxQueueCost: 2000,
   defaultMaxWaitMs: 5_000,
   windowMs: 1_000,
+  virtualLanes: false,
 });
-
-const RUNTIME_STORE_KEY = Symbol.for("omniroute.adaptiveAdmission.runtime");
 
 type RuntimeStore = {
   runtime: AdaptiveAdmissionRuntime | null;
 };
 
-type GlobalWithRuntimeStore = typeof globalThis & {
-  [RUNTIME_STORE_KEY]?: RuntimeStore;
-};
-
 function getRuntimeStore(): RuntimeStore {
-  const globalWithStore = globalThis as GlobalWithRuntimeStore;
-  let store = globalWithStore[RUNTIME_STORE_KEY];
-  if (!store) {
-    store = { runtime: null };
-    globalWithStore[RUNTIME_STORE_KEY] = store;
-  }
-  return store;
+  return getProcessStore("adaptiveAdmission.runtime", () => ({
+    runtime: null,
+  }));
 }
 
 const ENV_KEYS = {
@@ -117,6 +110,11 @@ export function resolveAdaptiveAdmissionConfigFromEnv(
 
   // Shared pure validation — accept exact documented maxima, reject core-invalid configs.
   validateConfig(cfg);
+
+  // Per-tenant virtual admission lanes (#9654) — opt-in via OMNIROUTE_CHAT_VIRTUAL_LANES.
+  const vlRaw = env.OMNIROUTE_CHAT_VIRTUAL_LANES;
+  cfg.virtualLanes = vlRaw === "1" || vlRaw === "true";
+
   return cfg;
 }
 
@@ -236,6 +234,12 @@ const REJECT_MAP: Record<AdmissionRejectCode, RejectHttpMapping> = {
     message: "Service temporarily unavailable",
     retryAfter: "1",
   },
+  ADMISSION_LANE_EVICTED: {
+    status: 503,
+    code: "admission_lane_evicted",
+    message: "Connection lane evicted",
+    retryAfter: "1",
+  },
 };
 
 function isAdmissionRejectError(
@@ -311,6 +315,7 @@ function classifyHttpOutcome(status: number, signal?: AbortSignal): AdmissionRel
 
 class AdaptiveAdmissionRuntimeImpl implements AdaptiveAdmissionRuntime {
   private readonly controller: AdaptiveAdmissionController;
+  private readonly costConfig: ReturnType<typeof resolveCostConfig>;
   private readonly checkResourcePressure: () => ResourcePressureGuardResult | null;
   private readonly getResourcePressureObservation: () => ResourcePressureObservation;
   private readonly onPressureObserved?: (pressure: AdmissionPressure) => void;
@@ -326,6 +331,7 @@ class AdaptiveAdmissionRuntimeImpl implements AdaptiveAdmissionRuntime {
 
   constructor(options: AdaptiveAdmissionRuntimeOptions, config: AdaptiveAdmissionConfig) {
     this.controller = new AdaptiveAdmissionController(config, options.clock);
+    this.costConfig = resolveCostConfig(config.cost);
     this.checkResourcePressure = options.checkResourcePressure ?? checkResourcePressureGuard;
     this.getResourcePressureObservation =
       options.getResourcePressureObservation ?? getResourcePressureObservation;
@@ -360,7 +366,10 @@ class AdaptiveAdmissionRuntimeImpl implements AdaptiveAdmissionRuntime {
 
     const features = extractAdmissionCostFeatures(
       input.body,
-      input.streaming === undefined ? undefined : { streaming: input.streaming }
+      {
+        streaming: input.streaming,
+        cost: this.costConfig,
+      }
     );
     let result: AdmissionAcquireResult;
     try {

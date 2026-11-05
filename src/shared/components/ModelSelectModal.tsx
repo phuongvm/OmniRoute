@@ -2,14 +2,32 @@
 
 import { useState, useMemo, useEffect } from "react";
 import { useTranslations } from "next-intl";
+import Icon from "./Icon";
 import Modal from "./Modal";
+import Button from "./Button";
+import Checkbox from "./Checkbox";
+import Input from "./Input";
+import { cn } from "@/shared/utils/cn";
 import {
   buildPassthroughAliasModels,
   buildNodeAliasModels,
   shouldConfirmSelectAll,
   parseHiddenModelsByProvider,
   isProviderModelHidden,
+  buildProviderTestTargets,
+  toggleProviderSelection,
+  chunkItems,
+  isProviderTestEntryWorking,
+  formatProviderTestResults,
+  collectWorkingModelsToSelect,
+  hasWorkingTestResults,
+  listVisibleProviderIds,
 } from "./modelSelectModalHelpers";
+import {
+  buildLiveModelEntries,
+  hasUsableLiveModels,
+  shouldFetchLiveModels,
+} from "./modelSelectLiveProviders";
 import { getModelsByProviderId, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
 import { getCompatibleFallbackModels } from "@/lib/providers/managedAvailableModels";
 import {
@@ -25,6 +43,12 @@ import {
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 import { hasEligibleConnectionForModel } from "@/domain/connectionModelRules";
+import { useNotificationStore } from "@/store/notificationStore";
+import { fetchProviderModels, type ProviderDegradation } from "./modelSelectDiscovery";
+import { DiscoveryDegradedNotice } from "./DiscoveryDegradedNotice";
+
+// Model/combo chips: compact pill on the kit outline Button (toggle via aria-pressed).
+const CHIP_CLASS = "h-auto min-h-0 rounded-xl px-2 py-1 text-xs font-medium";
 
 // Provider order: OAuth first, then no-auth, then API Key (matches dashboard/providers)
 const PROVIDER_ORDER = [
@@ -102,6 +126,7 @@ export default function ModelSelectModal({
   keepOpenOnSelect = false,
 }: ModelSelectModalProps) {
   const t = useTranslations("common");
+  const notify = useNotificationStore();
   const resolvedTitle = title ?? t("selectModel");
   const labelOrFallback = (key: string, fallback: string, values?: Record<string, unknown>) =>
     typeof (t as { has?: (k: string) => boolean }).has === "function" &&
@@ -132,82 +157,83 @@ export default function ModelSelectModal({
     localStorage.setItem("modelSelectShowConfiguredOnly", String(showConfiguredOnly));
   }, [showConfiguredOnly]);
   const [fetchedModels, setFetchedModels] = useState<Record<string, any[]>>({});
-
-  const fetchCombos = async () => {
-    try {
-      const res = await fetch("/api/combos");
-      if (!res.ok) throw new Error(`Failed to fetch combos: ${res.status}`);
-      const data = await res.json();
-      setCombos(data.combos || []);
-    } catch (error) {
-      console.error("Error fetching combos:", error);
-      setCombos([]);
-    }
-  };
+  // Providers whose list comes from the built-in catalog, with the reason.
+  const [degradedProviders, setDegradedProviders] = useState<Record<string, ProviderDegradation>>(
+    {}
+  );
+  // Provider-level selection for "Test Selected Providers" (combo builder only).
+  const [selectedProviderIds, setSelectedProviderIds] = useState<Set<string>>(() => new Set());
+  const [testingProviders, setTestingProviders] = useState(false);
+  const [testProgress, setTestProgress] = useState<{ done: number; total: number } | null>(null);
+  const [modelTestStatus, setModelTestStatus] = useState<Record<string, "ok" | "error">>({});
 
   useEffect(() => {
-    if (isOpen) fetchCombos();
-  }, [isOpen]);
-
-  const fetchProviderNodes = async () => {
-    try {
-      const res = await fetch("/api/provider-nodes");
-      if (!res.ok) throw new Error(`Failed to fetch provider nodes: ${res.status}`);
-      const data = await res.json();
-      setProviderNodes(data.nodes || []);
-    } catch (error) {
-      console.error("Error fetching provider nodes:", error);
-      setProviderNodes([]);
-    }
-  };
-
-  useEffect(() => {
-    if (isOpen) fetchProviderNodes();
-  }, [isOpen]);
-
-  const fetchCustomModels = async () => {
-    try {
-      const res = await fetch("/api/provider-models");
-      if (!res.ok) throw new Error(`Failed to fetch custom models: ${res.status}`);
-      const data = await res.json();
-      setCustomModels(data.models || {});
-      // #9203: keep the unified hidden-model map in sync with the model list.
-      setHiddenModelsByProvider(parseHiddenModelsByProvider(data.hiddenModelsByProvider));
-    } catch (error) {
-      console.error("Error fetching custom models:", error);
-      setCustomModels({});
-    }
-  };
-
-  useEffect(() => {
-    if (isOpen) fetchCustomModels();
-  }, [isOpen]);
-
-  // Fetch the live model catalog for one custom provider from its connection's
-  // upstream `/models` endpoint. Returns the model array, or null on any failure.
-  const fetchProviderModels = async (providerId: string): Promise<any[] | null> => {
-    try {
-      // Find the connection id for this provider — the route is keyed by connection.
-      const connection = activeProviders.find((p) => p.provider === providerId);
-      if (!connection?.id) return null;
-
-      // #9203: ask the live route to drop hidden models server-side too, so the
-      // operator's visibility settings apply before the rows reach the picker.
-      const res = await fetch(`/api/providers/${connection.id}/models?excludeHidden=true`);
-      if (!res.ok) {
-        console.warn(`Failed to fetch models for ${providerId}: ${res.status}`);
-        return null;
+    if (!isOpen) return;
+    const fetchCombos = async () => {
+      try {
+        const res = await fetch("/api/combos");
+        if (!res.ok) throw new Error(`Failed to fetch combos: ${res.status}`);
+        const data = await res.json();
+        setCombos(data.combos || []);
+      } catch (error) {
+        console.error("Error fetching combos:", error);
+        setCombos([]);
       }
-      const data = await res.json();
-      return data.models || [];
-    } catch (error) {
-      console.error(`Error fetching models for ${providerId}:`, error);
-      return null;
+    };
+    fetchCombos();
+  }, [isOpen]);
+
+  // Reset provider-test bookkeeping whenever the modal closes so the next
+  // open starts from a clean selection / progress state (render-time
+  // adjustment per react.dev "You Might Not Need an Effect").
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (isOpen !== prevIsOpen) {
+    setPrevIsOpen(isOpen);
+    if (!isOpen) {
+      setSelectedProviderIds(new Set());
+      setTestingProviders(false);
+      setTestProgress(null);
+      setModelTestStatus({});
     }
-  };
+  }
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const fetchProviderNodes = async () => {
+      try {
+        const res = await fetch("/api/provider-nodes");
+        if (!res.ok) throw new Error(`Failed to fetch provider nodes: ${res.status}`);
+        const data = await res.json();
+        setProviderNodes(data.nodes || []);
+      } catch (error) {
+        console.error("Error fetching provider nodes:", error);
+        setProviderNodes([]);
+      }
+    };
+    fetchProviderNodes();
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const fetchCustomModels = async () => {
+      try {
+        const res = await fetch("/api/provider-models");
+        if (!res.ok) throw new Error(`Failed to fetch custom models: ${res.status}`);
+        const data = await res.json();
+        setCustomModels(data.models || {});
+        // #9203: keep the unified hidden-model map in sync with the model list.
+        setHiddenModelsByProvider(parseHiddenModelsByProvider(data.hiddenModelsByProvider));
+      } catch (error) {
+        console.error("Error fetching custom models:", error);
+        setCustomModels({});
+      }
+    };
+    fetchCustomModels();
+  }, [isOpen]);
 
   // When the modal opens, dynamically load models for every connected custom
-  // (openai-/anthropic-compatible) provider in parallel.
+  // (openai-/anthropic-compatible) provider and every live-only catalog provider
+  // (empty static catalog + modelsUrl, e.g. zed-hosted) in parallel.
   useEffect(() => {
     if (!isOpen) return;
 
@@ -215,24 +241,36 @@ export default function ModelSelectModal({
 
     const loadCustomProviderModels = async () => {
       const customProviderIds = activeProviders
-        .filter(
-          (p) => isOpenAICompatibleProvider(p.provider) || isAnthropicCompatibleProvider(p.provider)
-        )
+        .filter((p) => shouldFetchLiveModels(p.provider))
         .map((p) => p.provider);
 
       if (customProviderIds.length === 0) return;
 
       const fetched: Record<string, any[]> = {};
+      const degraded: Record<string, ProviderDegradation> = {};
       await Promise.all(
         customProviderIds.map(async (providerId) => {
-          const models = await fetchProviderModels(providerId);
-          if (models && models.length > 1) {
-            fetched[providerId] = models;
+          const connection = activeProviders.find((p) => p.provider === providerId);
+          const discovery = await fetchProviderModels(providerId, connection?.id);
+          if (hasUsableLiveModels(providerId, discovery.models)) {
+            fetched[providerId] = discovery.models;
+          }
+          // A fallback catalog is reported even when it holds a single row: the
+          // list the operator sees is then the built-in one, and the reason
+          // must not be lost.
+          if (discovery.degraded) {
+            degraded[providerId] = {
+              degraded: true,
+              ...(discovery.cause ? { cause: discovery.cause } : {}),
+            };
           }
         })
       );
 
-      if (!cancelled) setFetchedModels(fetched);
+      if (!cancelled) {
+        setFetchedModels(fetched);
+        setDegradedProviders(degraded);
+      }
     };
 
     loadCustomProviderModels();
@@ -240,7 +278,6 @@ export default function ModelSelectModal({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, activeProviders]);
 
   const allProviders = useMemo(
@@ -374,25 +411,12 @@ export default function ModelSelectModal({
         // already filtered hidden rows via `excludeHidden=true`, but re-check the
         // unified map here so a hidden model is dropped even on the local-catalog
         // fallback path where the query param is not passed through.
-        const fetchedEntries = (fetchedModels[providerId] || [])
-          .map((m) => {
-            const id = m.id || m.slug || m.model || m.name;
-            return {
-              id,
-              name: m.name || m.displayName || id,
-              value: `${nodePrefix}/${id}`,
-              isFetched: true,
-              source: "auto",
-            };
-          })
-          .filter(
-            (fm) =>
-              fm.id &&
-              !nodeModels.some((nm) => nm.id === fm.id) &&
-              !fallbackEntries.some((fbm) => fbm.id === fm.id) &&
-              !customEntries.some((cm) => cm.id === fm.id)
-          )
-          .filter((fm) => !isHiddenForProvider(fm.id));
+        const fetchedEntries = buildLiveModelEntries({
+          liveModels: fetchedModels[providerId] || [],
+          prefix: nodePrefix,
+          existingIds: [...nodeModels, ...fallbackEntries, ...customEntries].map((m) => m.id),
+          isHidden: isHiddenForProvider,
+        });
 
         const allModels = [...nodeModels, ...fallbackEntries, ...customEntries, ...fetchedEntries];
 
@@ -430,7 +454,16 @@ export default function ModelSelectModal({
             source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
-        const allModels = [...systemEntries, ...customEntries];
+        // Live catalog (zed-hosted and other live-only providers); system and
+        // custom rows win over a live duplicate.
+        const fetchedEntries = buildLiveModelEntries({
+          liveModels: fetchedModels[providerId] || [],
+          prefix: alias,
+          existingIds: [...systemEntries, ...customEntries].map((m) => m.id),
+          isHidden: isHiddenForProvider,
+        });
+
+        const allModels = [...systemEntries, ...customEntries, ...fetchedEntries];
 
         if (allModels.length > 0) {
           groups[providerId] = {
@@ -537,6 +570,50 @@ export default function ModelSelectModal({
     typeof onDeselectMany === "function" &&
     visibleModels.length > 0;
 
+  // Same combo-builder gate as Select All — CLI tool cards and other single-pick
+  // callers should not grow provider checkboxes / a test toolbar.
+  const showProviderTestControls = keepOpenOnSelect && !multiSelect;
+
+  const workingModelsToSelect = useMemo(
+    () =>
+      collectWorkingModelsToSelect({
+        models: visibleModels,
+        modelTestStatus,
+        addedModelValues,
+        alreadyAdded: false,
+      }),
+    [visibleModels, modelTestStatus, addedModelValues]
+  );
+
+  const workingModelsToUnselect = useMemo(
+    () =>
+      collectWorkingModelsToSelect({
+        models: visibleModels,
+        modelTestStatus,
+        addedModelValues,
+        alreadyAdded: true,
+      }),
+    [visibleModels, modelTestStatus, addedModelValues]
+  );
+
+  const visibleProviderIds = useMemo(
+    () => listVisibleProviderIds(connectionFilteredGroups),
+    [connectionFilteredGroups]
+  );
+
+  const allProvidersChecked =
+    visibleProviderIds.length > 0 && visibleProviderIds.every((id) => selectedProviderIds.has(id));
+
+  const showSelectWorkingModels =
+    showProviderTestControls &&
+    typeof onSelectMany === "function" &&
+    typeof onDeselectMany === "function" &&
+    !testingProviders &&
+    hasWorkingTestResults(modelTestStatus);
+
+  const canAddWorking = workingModelsToSelect.length > 0;
+  const canRemoveWorking = workingModelsToUnselect.length > 0;
+
   const handleToggleSelectAllVisible = () => {
     if (!showSelectAllToggle) return;
     if (allVisibleSelected) {
@@ -563,6 +640,136 @@ export default function ModelSelectModal({
       return;
     }
     onSelectMany!(toAdd);
+  };
+
+  const handleToggleProviderForTest = (providerId: string) => {
+    setSelectedProviderIds((prev) => toggleProviderSelection(prev, providerId));
+  };
+
+  const handleSelectAllProviders = () => {
+    setSelectedProviderIds(new Set(visibleProviderIds));
+  };
+
+  const handleClearProviderSelection = () => {
+    setSelectedProviderIds(new Set());
+  };
+
+  /** Add or remove models that passed the last Test providers run. */
+  const handleToggleWorkingModels = () => {
+    if (!showSelectWorkingModels) return;
+    if (canAddWorking) {
+      if (
+        shouldConfirmSelectAll(workingModelsToSelect.length) &&
+        !confirm(
+          labelOrFallback(
+            "selectAllConfirm",
+            `Add ${workingModelsToSelect.length} models to this combo?`,
+            { count: workingModelsToSelect.length }
+          )
+        )
+      ) {
+        return;
+      }
+      onSelectMany!(workingModelsToSelect);
+      return;
+    }
+    if (canRemoveWorking && typeof onDeselectMany === "function") {
+      onDeselectMany(workingModelsToUnselect);
+    }
+  };
+
+  /**
+   * Smoke-test every currently-visible model under the providers the user
+   * checked — same /api/models/test-all + chunk-of-3 concurrency as the
+   * provider detail page "Test all models" button.
+   */
+  const handleTestSelectedProviders = async () => {
+    if (testingProviders) return;
+    if (selectedProviderIds.size === 0) {
+      notify.error(
+        labelOrFallback("noProvidersSelectedToTest", "Select at least one provider to test")
+      );
+      return;
+    }
+
+    const groups: Array<[string, Array<{ value?: string | null; id?: string | null }>]> =
+      Object.entries(connectionFilteredGroups).map(([providerId, group]: [string, any]) => [
+        providerId,
+        Array.isArray(group?.models) ? group.models : [],
+      ]);
+
+    const targets = buildProviderTestTargets({
+      selectedProviderIds,
+      groups,
+      activeProviders,
+    });
+
+    const flat = targets.flatMap((target) =>
+      target.modelIds.map((modelId) => ({
+        providerId: target.providerId,
+        connectionId: target.connectionId,
+        modelId,
+      }))
+    );
+
+    if (flat.length === 0) {
+      notify.error(
+        labelOrFallback(
+          "noModelsToTestForProviders",
+          "No models to test for the selected providers"
+        )
+      );
+      return;
+    }
+
+    setTestingProviders(true);
+    setTestProgress({ done: 0, total: flat.length });
+
+    let ok = 0;
+    let error = 0;
+
+    for (const chunk of chunkItems(flat)) {
+      await Promise.all(
+        chunk.map(async ({ providerId, connectionId, modelId }) => {
+          try {
+            const result: {
+              results?: Record<string, { status?: string | null }>;
+            } = await fetch("/api/models/test-all", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                providerId,
+                connectionId,
+                modelIds: [modelId],
+              }),
+            }).then((r) => r.json());
+
+            const entry = result.results?.[modelId];
+            const working = isProviderTestEntryWorking(entry);
+            if (working) ok++;
+            else error++;
+            setModelTestStatus((prev) => ({
+              ...prev,
+              [modelId]: working ? "ok" : "error",
+            }));
+          } catch {
+            error++;
+            setModelTestStatus((prev) => ({ ...prev, [modelId]: "error" }));
+          }
+          setTestProgress((prev) => (prev ? { done: prev.done + 1, total: prev.total } : null));
+        })
+      );
+    }
+
+    const total = ok + error;
+    notify.info(
+      labelOrFallback("testSelectedProvidersResults", formatProviderTestResults(ok, total), {
+        ok,
+        total,
+      })
+    );
+    setTestingProviders(false);
+    setTestProgress(null);
   };
 
   const resolvedSelectedModels = multiSelect
@@ -606,16 +813,15 @@ export default function ModelSelectModal({
   // `multiSelect` is on — that mode renders its own Clear + Done footer below the body.
   const doneFooter =
     keepOpenOnSelect && !multiSelect ? (
-      <button
-        type="button"
+      <Button
+        fullWidth
         onClick={() => {
           onClose();
           setSearchQuery("");
         }}
-        className="w-full px-3 py-2 text-sm font-medium rounded border border-primary bg-primary text-white hover:bg-primary/90 transition-colors"
       >
         {t("done")}
-      </button>
+      </Button>
     ) : null;
 
   return (
@@ -626,61 +832,154 @@ export default function ModelSelectModal({
         setSearchQuery("");
       }}
       title={resolvedTitle}
-      size="md"
-      className="p-4!"
+      size="xl"
+      className="p-4! max-w-2xl"
       footer={doneFooter}
     >
       {/* Search - compact */}
       <div className="mb-3">
-        <div className="relative">
-          <span className="material-symbols-outlined absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted text-[16px]">
-            search
-          </span>
-          <input
-            type="text"
-            placeholder={t("search")}
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-8 pr-3 py-1.5 bg-surface border border-border rounded text-xs focus:outline-none focus:ring-1 focus:ring-primary/50"
-          />
-        </div>
+        <Input
+          type="text"
+          icon="search"
+          placeholder={t("search")}
+          aria-label={t("search")}
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          inputClassName="text-xs"
+        />
       </div>
 
-      <div className="mt-1.5 mb-2 flex items-center justify-between gap-2">
-        <label className="flex items-center gap-1.5 text-xs text-text-muted cursor-pointer min-w-0">
-          <input
-            type="checkbox"
+      <div className="mt-1.5 mb-2 space-y-2">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <Checkbox
             checked={showConfiguredOnly}
             onChange={(e) => setShowConfiguredOnly(e.target.checked)}
-            className="rounded border-border"
+            label={<span className="truncate">{t("showConfiguredOnly")}</span>}
+            className="min-w-0 text-xs text-text-muted"
           />
-          <span className="truncate">{t("showConfiguredOnly")}</span>
-        </label>
 
-        {showSelectAllToggle && (
-          <button
-            type="button"
-            onClick={handleToggleSelectAllVisible}
-            data-testid="model-select-toggle-all-visible"
-            className="shrink-0 px-2 py-1 text-xs font-medium rounded border border-border bg-surface text-text-main hover:border-primary/50 hover:bg-primary/5 transition-colors"
+          {showSelectAllToggle && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleToggleSelectAllVisible}
+              data-testid="model-select-toggle-all-visible"
+              className="shrink-0 text-xs"
+            >
+              {allVisibleSelected
+                ? labelOrFallback("unselectAll", "Unselect all")
+                : labelOrFallback("selectAll", "Select all")}
+              <span className="ml-1 text-[10px] text-text-muted font-normal">
+                ({visibleModels.length})
+              </span>
+            </Button>
+          )}
+        </div>
+
+        {showProviderTestControls && (
+          <div
+            className="rounded-lg border border-border bg-bg-subtle px-2.5 py-2 space-y-2"
+            data-testid="model-select-provider-test-panel"
           >
-            {allVisibleSelected
-              ? labelOrFallback("unselectAll", "Unselect all")
-              : labelOrFallback("selectAll", "Select all")}
-            <span className="ml-1 text-[10px] text-text-muted font-normal">
-              ({visibleModels.length})
-            </span>
-          </button>
+            <p className="text-[11px] text-text-muted leading-snug">
+              {labelOrFallback(
+                "providerTestHint",
+                "Tip: check a provider → Test → Add working (or Remove working to undo)."
+              )}
+            </p>
+
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] text-text-muted">
+                  {labelOrFallback(
+                    "providersSelectedCount",
+                    `${selectedProviderIds.size} providers checked`,
+                    { count: selectedProviderIds.size }
+                  )}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={
+                    allProvidersChecked ? handleClearProviderSelection : handleSelectAllProviders
+                  }
+                  disabled={visibleProviderIds.length === 0 || testingProviders}
+                  data-testid="model-select-toggle-all-providers"
+                  className="text-[11px]"
+                >
+                  {allProvidersChecked
+                    ? labelOrFallback("clearProviderSelection", "Uncheck providers")
+                    : labelOrFallback("selectAllProviders", "Check all providers")}
+                </Button>
+              </div>
+
+              <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleTestSelectedProviders}
+                  disabled={testingProviders || selectedProviderIds.size === 0}
+                  data-testid="model-select-test-selected-providers"
+                  title={labelOrFallback("testSelectedProviders", "Test providers")}
+                  className="gap-1 text-xs"
+                >
+                  <Icon
+                    name={testingProviders ? "progress_activity" : "science"}
+                    size={14}
+                    className={testingProviders ? "animate-spin" : undefined}
+                  />
+                  <span>
+                    {testingProviders && testProgress
+                      ? labelOrFallback(
+                          "testingSelectedProviders",
+                          `Testing ${testProgress.done}/${testProgress.total}...`,
+                          testProgress
+                        )
+                      : labelOrFallback("testSelectedProviders", "Test providers")}
+                  </span>
+                </Button>
+
+                {showSelectWorkingModels && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleToggleWorkingModels}
+                    disabled={!canAddWorking && !canRemoveWorking}
+                    data-testid="model-select-working-models"
+                    className={cn(
+                      "shrink-0 text-xs",
+                      canRemoveWorking && "border-success/40 bg-success/15 text-success"
+                    )}
+                  >
+                    {canRemoveWorking
+                      ? labelOrFallback("unselectWorkingModels", "Unselect working")
+                      : labelOrFallback("selectWorkingModels", "Add working")}
+                    <span
+                      className={`ml-1 text-[10px] font-normal ${
+                        canRemoveWorking ? "opacity-80" : "text-text-muted"
+                      }`}
+                    >
+                      (
+                      {canRemoveWorking
+                        ? workingModelsToUnselect.length
+                        : workingModelsToSelect.length}
+                      )
+                    </span>
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
         )}
       </div>
 
       {/* Models grouped by provider - compact */}
-      <div className="max-h-[300px] overflow-y-auto space-y-3 isolate">
+      <div className="max-h-[min(50vh,420px)] overflow-y-auto space-y-3 isolate">
         {/* Combos section - always first */}
         {showCombos && filteredCombos.length > 0 && (
           <div>
             <div className="flex items-center gap-1.5 mb-1.5 sticky top-0 z-10 bg-surface py-1">
-              <span className="material-symbols-outlined text-primary text-[14px]">layers</span>
+              <Icon name="layers" size={14} className="text-primary" />
               <span className="text-xs font-medium text-primary">{t("combos")}</span>
               <span className="text-[10px] text-text-muted">({filteredCombos.length})</span>
             </div>
@@ -688,22 +987,23 @@ export default function ModelSelectModal({
               {filteredCombos.map((combo) => {
                 const isSelected = isValueSelected(combo.name);
                 return (
-                  <button
+                  <Button
                     key={combo.id}
+                    variant="outline"
+                    size="sm"
+                    aria-pressed={isSelected}
                     onClick={() =>
                       handleSelect({ id: combo.name, name: combo.name, value: combo.name })
                     }
-                    className={`
-                      px-2 py-1 rounded-xl text-xs font-medium transition-all border hover:cursor-pointer
-                      ${
-                        isSelected
-                          ? "bg-primary text-white border-primary"
-                          : "bg-surface border-border text-text-main hover:border-primary/50 hover:bg-primary/5"
-                      }
-                    `}
+                    className={cn(
+                      CHIP_CLASS,
+                      isSelected
+                        ? "bg-primary text-accent-foreground border-primary hover:bg-primary"
+                        : "hover:border-primary/50 hover:bg-primary/5"
+                    )}
                   >
                     {combo.name}
-                  </button>
+                  </Button>
                 );
               })}
             </div>
@@ -711,54 +1011,113 @@ export default function ModelSelectModal({
         )}
 
         {/* Provider models */}
-        {Object.entries(connectionFilteredGroups).map(([providerId, group]: [string, any]) => (
-          <div key={providerId}>
-            {/* Provider header — z-10 + opaque bg so scrolling chips don't bleed through */}
-            <div className="flex items-center gap-1.5 mb-1.5 sticky top-0 z-10 bg-surface py-1">
+        {Object.entries(connectionFilteredGroups).map(([providerId, group]: [string, any]) => {
+          const providerSelected = selectedProviderIds.has(providerId);
+          const degradation = degradedProviders[providerId];
+          return (
+            <div key={providerId}>
+              {degradation && (
+                <div className="mb-1.5">
+                  <DiscoveryDegradedNotice
+                    degraded={degradation.degraded}
+                    cause={degradation.cause}
+                  />
+                </div>
+              )}
+              {/* Provider header — opaque sticky bg so model chips never bleed through */}
               <div
-                className="w-2 h-2 rounded-full shrink-0"
-                style={{ backgroundColor: group.color }}
-              />
-              <span className="text-xs font-medium text-primary">{group.name}</span>
-              <span className="text-[10px] text-text-muted">({group.models.length})</span>
-            </div>
-
-            <div className="flex flex-wrap gap-1.5">
-              {group.models.map((model) => {
-                const isSelected = isValueSelected(model.value);
-                const isAdded = addedModelValues.includes(model.value);
-                return (
-                  <button
-                    key={model.id}
-                    onClick={() => handleSelect(model)}
-                    className={`
-                      px-2 py-1 rounded-xl text-xs font-medium transition-all border hover:cursor-pointer
-                      ${
-                        isSelected
-                          ? "bg-primary text-white border-primary"
-                          : isAdded
-                            ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-700 dark:text-emerald-400"
-                            : "bg-surface border-border text-text-main hover:border-primary/50 hover:bg-primary/5"
-                      }
-                    `}
-                  >
-                    {isAdded && <span className="mr-0.5 opacity-70">✓</span>}
-                    {model.name}
-                    {model.source && (
-                      <span className="ml-1 text-[10px] uppercase opacity-70">
-                        {getModelCatalogSourceLabel(model.source)}
+                className={`flex items-center gap-1.5 mb-2 sticky top-0 z-10 py-1.5 px-1 rounded bg-surface ${
+                  providerSelected ? "ring-1 ring-inset ring-primary/35" : ""
+                }`}
+              >
+                {showProviderTestControls ? (
+                  <Checkbox
+                    checked={providerSelected}
+                    onChange={() => handleToggleProviderForTest(providerId)}
+                    data-testid={`model-select-provider-checkbox-${providerId}`}
+                    aria-label={`Check ${group.name} for testing`}
+                    className="min-w-0 flex-1"
+                    label={
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        <span
+                          aria-hidden="true"
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: group.color }}
+                        />
+                        <span className="text-xs font-medium text-primary truncate">
+                          {group.name}
+                        </span>
+                        <span className="text-[10px] text-text-muted shrink-0">
+                          ({group.models.length})
+                        </span>
                       </span>
-                    )}
-                  </button>
-                );
-              })}
+                    }
+                  />
+                ) : (
+                  <>
+                    <div
+                      className="w-2 h-2 rounded-full shrink-0"
+                      style={{ backgroundColor: group.color }}
+                    />
+                    <span className="text-xs font-medium text-primary">{group.name}</span>
+                    <span className="text-[10px] text-text-muted">({group.models.length})</span>
+                  </>
+                )}
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {group.models.map((model) => {
+                  const isSelected = isValueSelected(model.value);
+                  const isAdded = addedModelValues.includes(model.value);
+                  const testStatus = modelTestStatus[model.value];
+                  return (
+                    <Button
+                      key={model.id}
+                      variant="outline"
+                      size="sm"
+                      aria-pressed={isSelected}
+                      onClick={() => handleSelect(model)}
+                      className={cn(
+                        CHIP_CLASS,
+                        isSelected
+                          ? "bg-primary text-accent-foreground border-primary hover:bg-primary"
+                          : isAdded
+                            ? "bg-success/15 border-success/30 text-success"
+                            : testStatus === "ok"
+                              ? "border-success/40"
+                              : testStatus === "error"
+                                ? "border-error/40"
+                                : "hover:border-primary/50 hover:bg-primary/5"
+                      )}
+                    >
+                      {isAdded && <span className="mr-0.5 opacity-70">✓</span>}
+                      {model.name}
+                      {model.source && (
+                        <span className="ml-1 text-[10px] uppercase opacity-70">
+                          {getModelCatalogSourceLabel(model.source)}
+                        </span>
+                      )}
+                      {testStatus === "ok" && (
+                        <span className="ml-1 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide bg-success/20 text-success">
+                          ok
+                        </span>
+                      )}
+                      {testStatus === "error" && (
+                        <span className="ml-1 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide bg-error/20 text-error">
+                          fail
+                        </span>
+                      )}
+                    </Button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
 
         {Object.keys(connectionFilteredGroups).length === 0 && filteredCombos.length === 0 && (
           <div className="text-center py-4 text-text-muted">
-            <span className="material-symbols-outlined text-2xl mb-1 block">search_off</span>
+            <Icon name="search_off" size={24} className="mb-1 block" />
             <p className="text-xs">{t("noModelsFound")}</p>
           </div>
         )}
@@ -767,23 +1126,19 @@ export default function ModelSelectModal({
         <div className="mt-4 flex items-center justify-between gap-2 border-t border-border pt-3">
           <span className="text-xs text-text-muted">{resolvedSelectedModels.length} selected</span>
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onSelect(null)}
-              className="px-2 py-1 text-xs rounded border border-border bg-surface hover:bg-primary/5"
-            >
+            <Button variant="outline" size="sm" onClick={() => onSelect(null)}>
               {t("clear")}
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => {
                 onClose();
                 setSearchQuery("");
               }}
-              className="px-2 py-1 text-xs rounded border border-border bg-surface hover:bg-primary/5"
             >
               {t("done")}
-            </button>
+            </Button>
           </div>
         </div>
       )}

@@ -73,6 +73,17 @@ vi.mock("@/shared/constants/cliTools", () => ({
       baseUrlSupport: "full",
       defaultModels: [],
     },
+    "grok-build": {
+      id: "grok-build",
+      name: "Grok Build",
+      icon: "terminal",
+      color: "#1DA1F2",
+      category: "code",
+      configType: "custom",
+      vendor: "xAI",
+      baseUrlSupport: "full",
+      defaultModels: [],
+    },
     "hermes-agent": {
       id: "hermes-agent",
       name: "Hermes Agent",
@@ -81,6 +92,17 @@ vi.mock("@/shared/constants/cliTools", () => ({
       category: "agent",
       configType: "custom",
       vendor: "HermesAI",
+      baseUrlSupport: "full",
+      defaultModels: [],
+    },
+    pi: {
+      id: "pi",
+      name: "Pi",
+      icon: "terminal",
+      color: "#F59E0B",
+      category: "code",
+      configType: "custom",
+      vendor: "OSS (M. Zechner)",
       baseUrlSupport: "full",
       defaultModels: [],
     },
@@ -125,6 +147,8 @@ vi.mock("../../../src/app/(dashboard)/dashboard/cli-code/components/index", () =
   CopilotToolCard: () => <div data-testid="CopilotToolCard" />,
   CustomCliCard: () => <div data-testid="CustomCliCard" />,
   HermesAgentToolCard: () => <div data-testid="HermesAgentToolCard" />,
+  GrokBuildToolCard: () => <div data-testid="GrokBuildToolCard" />,
+  PiToolCard: () => <div data-testid="PiToolCard" />,
 }));
 
 vi.mock("../../../src/app/(dashboard)/dashboard/cli-code/components/CliproxyapiToolCard", () => ({
@@ -286,6 +310,20 @@ describe("ToolDetailClient", () => {
     const card = container.querySelector("[data-testid='DefaultToolCard']");
     expect(card).not.toBeNull();
     expect(card!.getAttribute("data-toolid")).toBe("forge");
+  });
+
+  it("renders GrokBuildToolCard for grok-build", async () => {
+    const container = renderDetail("grok-build", "code");
+    await act(async () => {});
+    expect(container.querySelector("[data-testid='GrokBuildToolCard']")).not.toBeNull();
+    expect(container.querySelector("[data-testid='DefaultToolCard']")).toBeNull();
+  });
+
+  it("renders PiToolCard for pi (no longer falls back to DefaultToolCard)", async () => {
+    const container = renderDetail("pi", "code");
+    await act(async () => {});
+    expect(container.querySelector("[data-testid='PiToolCard']")).not.toBeNull();
+    expect(container.querySelector("[data-testid='DefaultToolCard']")).toBeNull();
   });
 
   it("renders nothing (null) for completely unknown toolId", async () => {

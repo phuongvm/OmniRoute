@@ -36,7 +36,7 @@ function toolOutputs(input: InputItem[]): InputItem[] {
 
 test.after(() => {
   core.resetDbInstance();
-  rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("Codex strips function_call_output items without matching function calls", () => {
@@ -76,6 +76,7 @@ test("Codex keeps matched outputs and removes orphaned outputs from mixed input"
     { type: "function_call_output", call_id: "call_orphan", output: "orphaned" },
   ]);
 
+  assert.equal(result.length, 2);
   assert.deepEqual(toolOutputs(result), [
     { type: "function_call_output", call_id: "call_keep", output: "ok" },
   ]);

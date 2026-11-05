@@ -68,15 +68,21 @@ function renderHook(params: UseModelImportHandlersParams): { get: () => HookResu
   };
 }
 
-function conn(id: string, active: boolean, autoSync?: boolean) {
+function conn(
+  id: string,
+  active: boolean,
+  settings: { autoSync?: boolean; autoFetchModels?: boolean } = {}
+) {
   return {
     id,
     isActive: active,
-    providerSpecificData: autoSync === undefined ? {} : { autoSync },
+    providerSpecificData: settings,
   };
 }
 
 beforeEach(() => {
+  // Successful imports intentionally reload the page after 2s; own that timer in each test.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   (
     globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
   ).IS_REACT_ACT_ENVIRONMENT = true;
@@ -85,27 +91,38 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const { root, el } of roots.splice(0)) {
-    act(() => root.unmount());
-    el.remove();
+  try {
+    for (const { root, el } of roots.splice(0)) {
+      act(() => root.unmount());
+      el.remove();
+    }
+  } finally {
+    // Do not navigate after jsdom teardown or leak fake timers into the next test.
+    vi.clearAllTimers();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
   }
-  vi.unstubAllGlobals();
 });
 
 describe("useModelImportHandlers — master autoSync", () => {
   it("isAutoSyncEnabled is true only when every active connection has autoSync on", () => {
     const mixed = renderHook(
-      buildParams({ connections: [conn("a", true, true), conn("b", true, false)] })
+      buildParams({ connections: [conn("a", true, { autoSync: true }), conn("b", true)] })
     );
     expect(mixed.get().isAutoSyncEnabled).toBe(false);
 
     const allOn = renderHook(
-      buildParams({ connections: [conn("a", true, true), conn("b", true, true)] })
+      buildParams({
+        connections: [conn("a", true, { autoSync: true }), conn("b", true, { autoSync: true })],
+      })
     );
     expect(allOn.get().isAutoSyncEnabled).toBe(true);
 
     const oneOff = renderHook(
-      buildParams({ connections: [conn("a", true, true), conn("b", false, true)] })
+      buildParams({
+        connections: [conn("a", true, { autoSync: true }), conn("b", false, { autoSync: true })],
+      })
     );
     expect(oneOff.get().isAutoSyncEnabled).toBe(true);
   });
@@ -114,7 +131,7 @@ describe("useModelImportHandlers — master autoSync", () => {
     const fetchConnections = vi.fn().mockResolvedValue(undefined);
     const hook = renderHook(
       buildParams({
-        connections: [conn("conn-a", true, false), conn("conn-b", true, false)],
+        connections: [conn("conn-a", true), conn("conn-b", true)],
         fetchConnections,
       })
     );
@@ -125,7 +142,7 @@ describe("useModelImportHandlers — master autoSync", () => {
       await hook.get().handleToggleAutoSync();
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "/api/providers/conn-a",
@@ -136,13 +153,16 @@ describe("useModelImportHandlers — master autoSync", () => {
       "/api/providers/conn-b",
       expect.objectContaining({ method: "PUT" })
     );
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/sync-models"))
+    ).toHaveLength(2);
     expect(fetchConnections).toHaveBeenCalled();
   });
 
   it("excludes inactive connections from the fan-out", async () => {
     const hook = renderHook(
       buildParams({
-        connections: [conn("conn-a", true, false), conn("conn-inactive", false, false)],
+        connections: [conn("conn-a", true), conn("conn-inactive", false)],
       })
     );
     const fetchMock = vi.mocked(fetch);
@@ -152,7 +172,7 @@ describe("useModelImportHandlers — master autoSync", () => {
       await hook.get().handleToggleAutoSync();
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "/api/providers/conn-a",
@@ -163,7 +183,7 @@ describe("useModelImportHandlers — master autoSync", () => {
   it("toggling from a mixed state (one on, one off) turns all active connections on", async () => {
     const hook = renderHook(
       buildParams({
-        connections: [conn("conn-a", true, true), conn("conn-b", true, false)],
+        connections: [conn("conn-a", true, { autoSync: true }), conn("conn-b", true)],
       })
     );
     const fetchMock = vi.mocked(fetch);
@@ -174,7 +194,7 @@ describe("useModelImportHandlers — master autoSync", () => {
     });
 
     expect(hook.get().isAutoSyncEnabled).toBe(false);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "/api/providers/conn-a",
@@ -189,6 +209,9 @@ describe("useModelImportHandlers — master autoSync", () => {
     const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body as string);
     expect(firstBody.providerSpecificData).toEqual({ autoSync: true });
     expect(secondBody.providerSpecificData).toEqual({ autoSync: true });
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/sync-models"))
+    ).toHaveLength(1);
     expect(notify.success).toHaveBeenCalled();
   });
 
@@ -196,12 +219,13 @@ describe("useModelImportHandlers — master autoSync", () => {
     const fetchConnections = vi.fn().mockResolvedValue(undefined);
     const hook = renderHook(
       buildParams({
-        connections: [conn("conn-a", true, false), conn("conn-b", true, false)],
+        connections: [conn("conn-a", true), conn("conn-b", true)],
         fetchConnections,
       })
     );
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce({ ok: false, status: 500 } as Response);
+    fetchMock.mockResolvedValueOnce({ ok: true } as Response);
     fetchMock.mockResolvedValueOnce({ ok: true } as Response);
 
     await act(async () => {
@@ -217,7 +241,7 @@ describe("useModelImportHandlers — master autoSync", () => {
   it("notifies error when every fan-out PUT fails", async () => {
     const hook = renderHook(
       buildParams({
-        connections: [conn("conn-a", true, false), conn("conn-b", true, false)],
+        connections: [conn("conn-a", true), conn("conn-b", true)],
       })
     );
     const fetchMock = vi.mocked(fetch);
@@ -233,7 +257,7 @@ describe("useModelImportHandlers — master autoSync", () => {
   });
 
   it("no-ops without a PUT or notification when there are no active connections", async () => {
-    const hook = renderHook(buildParams({ connections: [conn("conn-a", false, false)] }));
+    const hook = renderHook(buildParams({ connections: [conn("conn-a", false)] }));
     const fetchMock = vi.mocked(fetch);
 
     await act(async () => {
@@ -243,5 +267,173 @@ describe("useModelImportHandlers — master autoSync", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(notify.success).not.toHaveBeenCalled();
     expect(notify.error).not.toHaveBeenCalled();
+  });
+});
+
+describe("useModelImportHandlers — upstream model auto-fetch", () => {
+  it("defaults to off until every active connection explicitly enables it", () => {
+    const defaultOff = renderHook(buildParams({ connections: [conn("a", true)] }));
+    expect(defaultOff.get().isAutoFetchModelsEnabled).toBe(false);
+
+    const allOn = renderHook(
+      buildParams({
+        connections: [
+          conn("a", true, { autoFetchModels: true }),
+          conn("b", true, { autoFetchModels: true }),
+        ],
+      })
+    );
+    expect(allOn.get().isAutoFetchModelsEnabled).toBe(true);
+  });
+
+  it("enables auto-fetch on every active connection", async () => {
+    const fetchConnections = vi.fn().mockResolvedValue(undefined);
+    const hook = renderHook(
+      buildParams({ connections: [conn("conn-a", true), conn("conn-b", true)], fetchConnections })
+    );
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue({ ok: true } as Response);
+
+    await act(async () => {
+      await hook.get().handleToggleAutoFetchModels();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init).toEqual(
+        expect.objectContaining({
+          method: "PUT",
+          body: JSON.stringify({ providerSpecificData: { autoFetchModels: true } }),
+        })
+      );
+    }
+    expect(fetchConnections).toHaveBeenCalled();
+  });
+});
+
+describe("useModelImportHandlers — imported model metadata", () => {
+  it("preserves a discovered per-model targetFormat", async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const hook = renderHook(
+      buildParams({
+        providerId: "vertex",
+        connections: [conn("vertex-connection", true)],
+      })
+    );
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          models: [
+            {
+              id: "grok-4.6",
+              name: "Grok 4.6",
+              apiFormat: "chat-completions",
+              supportedEndpoints: ["chat"],
+              targetFormat: "openai",
+            },
+          ],
+        }),
+      } as Response)
+      .mockResolvedValue({ ok: true } as Response);
+
+    await act(async () => {
+      await hook.get().handleImportModels();
+    });
+
+    expect(setTimeoutSpy.mock.calls.filter(([, delay]) => delay === 2000)).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    const createCall = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/provider-models" && init?.method === "POST"
+    );
+    expect(createCall).toBeDefined();
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual(
+      expect.objectContaining({
+        provider: "vertex",
+        modelId: "grok-4.6",
+        targetFormat: "openai",
+      })
+    );
+  });
+});
+
+describe("useModelImportHandlers — failed model creation", () => {
+  const rejected = {
+    ok: false,
+    status: 400,
+    json: async () => ({
+      error: {
+        message: "Invalid request",
+        details: [{ field: "apiFormat", message: "Invalid enum value" }],
+      },
+    }),
+  } as unknown as Response;
+
+  function mockImport(catalog: Array<{ id: string }>, failingIds: string[]) {
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (input === "/api/provider-models" && init?.method === "POST") {
+        const { modelId } = JSON.parse(String(init.body));
+        return failingIds.includes(modelId) ? rejected : ({ ok: true } as Response);
+      }
+      return { ok: true, json: async () => ({ models: catalog }) } as Response;
+    });
+  }
+
+  it("reports an error instead of success when every model is rejected (bug repro)", async () => {
+    const handleSetAlias = vi.fn().mockResolvedValue(undefined);
+    const hook = renderHook(
+      buildParams({
+        providerId: "soniox",
+        providerStorageAlias: "sx",
+        connections: [conn("sx", true)],
+        handleSetAlias,
+      })
+    );
+    mockImport([{ id: "tts-rt-v2" }, { id: "stt-async-v5" }], ["tts-rt-v2", "stt-async-v5"]);
+
+    await act(async () => {
+      await hook.get().handleImportModels();
+    });
+
+    const progress = hook.get().importProgress;
+    expect(progress.phase).toBe("error");
+    expect(progress.importedCount).toBe(0);
+    expect(progress.error).toContain("apiFormat: Invalid enum value");
+    expect(progress.logs.some((line) => line.includes("tts-rt-v2"))).toBe(true);
+    expect(handleSetAlias).not.toHaveBeenCalled();
+  });
+
+  it("counts only the models the server accepted and keeps the failures on screen", async () => {
+    const handleSetAlias = vi.fn().mockResolvedValue(undefined);
+    const fetchProviderModelMeta = vi.fn().mockResolvedValue(undefined);
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const hook = renderHook(
+      buildParams({
+        providerId: "soniox",
+        providerStorageAlias: "sx",
+        connections: [conn("sx", true)],
+        handleSetAlias,
+        fetchProviderModelMeta,
+      })
+    );
+    mockImport([{ id: "tts-rt-v2" }, { id: "stt-async-v5" }], ["tts-rt-v2"]);
+
+    await act(async () => {
+      await hook.get().handleImportModels();
+    });
+
+    const progress = hook.get().importProgress;
+    expect(progress.phase).toBe("done");
+    expect(progress.importedCount).toBe(1);
+    expect(progress.logs.some((line) => line.includes("bulkFailedCount"))).toBe(true);
+    expect(handleSetAlias).toHaveBeenCalledTimes(1);
+    expect(handleSetAlias).toHaveBeenCalledWith("stt-async-v5", "stt-async-v5", "sx");
+    // No 2s auto-reload (it would wipe the failure lines); the listing is refreshed in place.
+    expect(setTimeoutSpy.mock.calls.some(([, delay]) => delay === 2000)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fetchProviderModelMeta).toHaveBeenCalledTimes(2);
+    setTimeoutSpy.mockRestore();
   });
 });

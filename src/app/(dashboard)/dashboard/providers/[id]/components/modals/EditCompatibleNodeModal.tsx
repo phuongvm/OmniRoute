@@ -1,9 +1,13 @@
 "use client";
-import { useState, useEffect } from "react";
+
+import Icon from "@/shared/components/Icon";
+import { useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Badge, Input, Modal, Select, Toggle } from "@/shared/components";
+import { isValidProviderIconUrl } from "@/shared/validation/iconUrl";
 import { CC_COMPATIBLE_DEFAULT_CHAT_PATH } from "../../providerDetailConstants";
 import NewApiAggregatorFields from "./NewApiAggregatorFields";
+import { providerText } from "../../providerPageHelpers";
 interface EditCompatibleNodeModalNode {
   id?: string;
   name?: string;
@@ -13,6 +17,8 @@ interface EditCompatibleNodeModalNode {
   chatPath?: string;
   modelsPath?: string;
   iconUrl?: string;
+  dailyQuotaResetTimezone?: string | null;
+  dailyQuotaResetHour?: number | null;
   providerSpecificData?: Record<string, unknown>;
 }
 
@@ -46,6 +52,8 @@ export default function EditCompatibleNodeModal({
     consoleApiKey: "",
     newApiUserId: "",
     quotaPerUnit: "",
+    dailyQuotaResetTimezone: "",
+    dailyQuotaResetHour: "",
   });
   const [saving, setSaving] = useState(false);
   const [checkKey, setCheckKey] = useState("");
@@ -57,9 +65,26 @@ export default function EditCompatibleNodeModal({
     method?: string | null;
   }>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [iconUrlError, setIconUrlError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (node) {
+  // Modal-open form initialization from the node being edited — applied as a
+  // render-phase adjustment guarded by the previously initialized node
+  // (react.dev "adjusting state when a prop changes") instead of a
+  // synchronous-setState effect. Closing clears the marker so the next open
+  // re-initializes again.
+  const [initializedFor, setInitializedFor] = useState<{
+    node: EditCompatibleNodeModalNode;
+    isAnthropic?: boolean;
+    isCcCompatible?: boolean;
+  } | null>(null);
+  if (isOpen && node) {
+    if (
+      initializedFor?.node !== node ||
+      initializedFor.isAnthropic !== isAnthropic ||
+      initializedFor.isCcCompatible !== isCcCompatible
+    ) {
+      setInitializedFor({ node, isAnthropic, isCcCompatible });
       const psd = (node.providerSpecificData || {}) as Record<string, unknown>;
       setFormData({
         name: node.name || "",
@@ -79,7 +104,14 @@ export default function EditCompatibleNodeModal({
         consoleApiKey: typeof psd.consoleApiKey === "string" ? psd.consoleApiKey : "",
         newApiUserId: typeof psd.newApiUserId === "string" ? psd.newApiUserId : "",
         quotaPerUnit: typeof psd.quotaPerUnit === "number" ? String(psd.quotaPerUnit) : "",
+        dailyQuotaResetTimezone: node.dailyQuotaResetTimezone || "",
+        dailyQuotaResetHour:
+          node.dailyQuotaResetHour === 0 || node.dailyQuotaResetHour
+            ? String(node.dailyQuotaResetHour)
+            : "",
       });
+      setSaveError(null);
+      setIconUrlError(null);
       setShowAdvanced(
         !!(
           node.chatPath ||
@@ -88,7 +120,9 @@ export default function EditCompatibleNodeModal({
         )
       );
     }
-  }, [node, isAnthropic, isCcCompatible]);
+  } else if (initializedFor !== null) {
+    setInitializedFor(null);
+  }
 
   const apiTypeOptions = [
     { value: "chat", label: t("chatCompletions") },
@@ -101,6 +135,13 @@ export default function EditCompatibleNodeModal({
 
   const handleSubmit = async () => {
     if (!formData.name.trim() || !formData.prefix.trim() || !formData.baseUrl.trim()) return;
+    const iconUrl = formData.iconUrl.trim();
+    if (!isValidProviderIconUrl(iconUrl)) {
+      setIconUrlError(t("iconUrlInvalid"));
+      return;
+    }
+    setIconUrlError(null);
+    setSaveError(null);
     setSaving(true);
     try {
       const payload: any = {
@@ -111,6 +152,10 @@ export default function EditCompatibleNodeModal({
         modelsPath: isCcCompatible ? "" : formData.modelsPath,
         iconUrl: formData.iconUrl.trim(),
       };
+      const tz = formData.dailyQuotaResetTimezone.trim();
+      payload.dailyQuotaResetTimezone = tz || null;
+      const hourRaw = formData.dailyQuotaResetHour.trim();
+      payload.dailyQuotaResetHour = hourRaw === "" ? null : Number(hourRaw);
       if (!isAnthropic) {
         payload.apiType = formData.apiType;
       }
@@ -131,6 +176,12 @@ export default function EditCompatibleNodeModal({
         }
       }
       await onSave(payload);
+    } catch (error) {
+      setSaveError(
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : providerText(t, "failedSave", "Failed to save")
+      );
     } finally {
       setSaving(false);
     }
@@ -160,7 +211,10 @@ export default function EditCompatibleNodeModal({
         method: data.method ?? null,
       });
     } catch {
-      setValidationResult({ valid: false, error: "Network error" });
+      setValidationResult({
+        valid: false,
+        error: providerText(t, "networkError", "Network error"),
+      });
     } finally {
       setValidating(false);
     }
@@ -180,11 +234,9 @@ export default function EditCompatibleNodeModal({
     >
       <div className="flex flex-col gap-4">
         {isCcCompatible && (
-          <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-sm text-text-muted">
+          <div className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-sm text-text-muted">
             <div className="flex items-start gap-2">
-              <span className="material-symbols-outlined mt-0.5 text-[18px] text-amber-500">
-                warning
-              </span>
+              <Icon name="warning" size={18} className="mt-0.5 text-warning" />
               <p>{t("ccCompatibleValidationHint")}</p>
             </div>
           </div>
@@ -247,7 +299,7 @@ export default function EditCompatibleNodeModal({
           value={formData.iconUrl}
           onChange={(e) => setFormData({ ...formData, iconUrl: e.target.value })}
           placeholder="https://example.com/logo.png"
-          hint={t("iconUrlHint")}
+          hint={iconUrlError ?? t("iconUrlHint")}
         />
         <Toggle
           label={t("newApiAggregatorToggleLabel")}
@@ -267,21 +319,21 @@ export default function EditCompatibleNodeModal({
           onChange={(patch) => setFormData({ ...formData, ...patch })}
           t={t}
         />
-        <button
-          type="button"
-          className="text-sm text-text-muted hover:text-text-primary flex items-center gap-1"
+        <Button
+          variant="ghost"
+          size="sm"
+          className="self-start"
           onClick={() => setShowAdvanced(!showAdvanced)}
           aria-expanded={showAdvanced}
           aria-controls="advanced-settings"
         >
-          <span
+          <Icon
+            name="chevron_right"
+            size={14}
             className={`transition-transform ${showAdvanced ? "rotate-90" : ""}`}
-            aria-hidden="true"
-          >
-            ▶
-          </span>
+          />
           {t("advancedSettings")}
-        </button>
+        </Button>
         {showAdvanced && (
           <div id="advanced-settings" className="flex flex-col gap-3 pl-2 border-l-2 border-border">
             <Input
@@ -306,6 +358,22 @@ export default function EditCompatibleNodeModal({
                 hint={t("modelsPathHint")}
               />
             )}
+            <Input
+              label={t("dailyQuotaResetTimezoneLabel")}
+              value={formData.dailyQuotaResetTimezone}
+              onChange={(e) =>
+                setFormData({ ...formData, dailyQuotaResetTimezone: e.target.value })
+              }
+              placeholder="Asia/Shanghai"
+              hint={t("dailyQuotaResetTimezoneHint")}
+            />
+            <Input
+              label={t("dailyQuotaResetHourLabel")}
+              value={formData.dailyQuotaResetHour}
+              onChange={(e) => setFormData({ ...formData, dailyQuotaResetHour: e.target.value })}
+              placeholder="0"
+              hint={t("dailyQuotaResetHourHint")}
+            />
           </div>
         )}
         <div className="flex gap-2">
@@ -340,11 +408,20 @@ export default function EditCompatibleNodeModal({
             </Badge>
             {validationResult.error && (
               <span
-                className={`text-sm ${validationResult.valid ? "text-text-muted" : "text-red-500"}`}
+                className={`text-sm ${validationResult.valid ? "text-text-muted" : "text-error"}`}
               >
                 {validationResult.error}
               </span>
             )}
+          </div>
+        )}
+        {saveError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="text-sm text-error bg-error/10 border border-error/20 rounded-lg px-3 py-2"
+          >
+            {saveError}
           </div>
         )}
         <div className="flex gap-2">

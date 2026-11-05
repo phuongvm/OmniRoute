@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { syncStandaloneExtraModules } from "../../../scripts/build/assembleStandalone.mjs";
 
-const repoRoot = path.resolve(new URL(".", import.meta.url).pathname, "../../..");
+const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
 /**
  * Regression guard for #9451: the MITM `server.cjs` runs as a separate `node`
@@ -31,7 +32,7 @@ test("EXTRA_MODULE_ENTRIES ships every relative require() of MITM server.cjs (#9
       );
     }
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -69,6 +70,6 @@ test("EXTRA_MODULE_ENTRIES ships every dynamic import() of MITM _internal shims 
       );
     }
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

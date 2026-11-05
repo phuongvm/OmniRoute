@@ -57,15 +57,13 @@ test("isFreeModel: a model id listed in the free catalog for that provider is fr
   assert.equal(isFreeModel(sample.provider, { id: sample.modelId }), true);
 });
 
-test("isFreeModel: NVIDIA GLM 5.2 is included in the reviewed trial catalog", () => {
-  assert.equal(isFreeModel("nvidia", { id: "z-ai/glm-5.2" }), true);
+test("isFreeModel: NVIDIA's retired GPT OSS 120B left the trial catalog (#18418)", () => {
+  assert.equal(isFreeModel("nvidia", { id: "openai/gpt-oss-120b" }), false);
+  assert.equal(isFreeModel("nvidia", { id: "nvidia/nemotron-3.5-super-vl-120b-a12b" }), true);
 });
 
 test("selectModelsForImport: passthrough when importFreeOnly is false", () => {
-  const models = [
-    { id: "a:free" },
-    { id: "b", pricing: { prompt: "0.01", completion: "0.02" } },
-  ];
+  const models = [{ id: "a:free" }, { id: "b", pricing: { prompt: "0.01", completion: "0.02" } }];
   const result = selectModelsForImport("openrouter", models, false);
   assert.equal(result.models.length, 2);
   assert.equal(result.freeFilterEmpty, false);
@@ -130,8 +128,14 @@ test("sortModelsFreeFirst: deterministic (alphabetical) within each group, regar
     ],
     { isFree: (m) => m.isFree, key: (m) => m.id }
   );
-  assert.deepEqual(a.map((m) => m.id), ["a", "b", "c"]);
-  assert.deepEqual(b.map((m) => m.id), ["a", "b", "c"]);
+  assert.deepEqual(
+    a.map((m) => m.id),
+    ["a", "b", "c"]
+  );
+  assert.deepEqual(
+    b.map((m) => m.id),
+    ["a", "b", "c"]
+  );
 });
 
 test("sortModelsFreeFirst: does not mutate the input array", () => {
@@ -141,5 +145,8 @@ test("sortModelsFreeFirst: does not mutate the input array", () => {
   ];
   const before = items.map((m) => m.id);
   sortModelsFreeFirst(items, { isFree: (m) => m.isFree, key: (m) => m.id });
-  assert.deepEqual(items.map((m) => m.id), before);
+  assert.deepEqual(
+    items.map((m) => m.id),
+    before
+  );
 });

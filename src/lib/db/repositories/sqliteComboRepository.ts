@@ -11,6 +11,10 @@ import type {
 import { normalizeComboRecord } from "@/lib/combos/steps";
 import { validateComboInvariant } from "@/lib/combos/invariants";
 import { getDbInstance } from "../core";
+import { deleteLKGPRowsByComboName } from "../settings/lkgp";
+import { clearRotationState } from "../proxies/rotation";
+import { bumpProxyRegistryGeneration } from "../proxies/registryGeneration";
+import { revokeComboGrantsByName } from "../apiKeys/comboGrantRevocation";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -32,6 +36,25 @@ function withSortOrder(payload: string, sortOrder: number | null): JsonRecord {
   const parsed = JSON.parse(payload) as JsonRecord;
   if (typeof sortOrder === "number") {
     parsed.sortOrder = sortOrder;
+  }
+  return parsed;
+}
+
+function getComboId(value: unknown): string | null {
+  const row = asRecord(value);
+  return typeof row.id === "string" && row.id.trim().length > 0 ? row.id : null;
+}
+
+/**
+ * Enforces the SQLite row's primary key id on the parsed JSON record.
+ * The database row.id column is always authoritative over any stale id
+ * persisted inside the data JSON blob (e.g. from duplication or import).
+ */
+function withRowId(payload: string, row: JsonRecord): JsonRecord {
+  const parsed = withSortOrder(payload, getSortOrder(row));
+  const comboId = getComboId(row);
+  if (comboId) {
+    parsed.id = comboId;
   }
   return parsed;
 }
@@ -72,7 +95,7 @@ function normalizeStoredCombo(
 function parseComboRow(row: unknown): JsonRecord | null {
   const payload = getSerializedData(row);
   if (!payload) return null;
-  const parsed = withSortOrder(payload, getSortOrder(row));
+  const parsed = withRowId(payload, asRecord(row));
   // Merge deduplicated column values back into the record
   const record = asRecord(row);
   if (record.context_cache_protection !== undefined && record.context_cache_protection !== null) {
@@ -97,7 +120,7 @@ function getNextSortOrder() {
 export async function getCombos(limit?: number, offset?: number) {
   const db = getDbInstance();
   let sql =
-    "SELECT data, sort_order, context_cache_protection FROM combos ORDER BY sort_order ASC, name COLLATE NOCASE ASC";
+    "SELECT id, data, sort_order, context_cache_protection FROM combos ORDER BY sort_order ASC, name COLLATE NOCASE ASC";
   const params: unknown[] = [];
   if (limit !== undefined) {
     sql += " LIMIT ? OFFSET ?";
@@ -129,7 +152,7 @@ export function getCombosCount(): number {
 export async function getComboById(id: string) {
   const db = getDbInstance();
   const row = db
-    .prepare("SELECT data, sort_order, context_cache_protection FROM combos WHERE id = ?")
+    .prepare("SELECT id, data, sort_order, context_cache_protection FROM combos WHERE id = ?")
     .get(id);
   const combo = parseComboRow(row);
   if (!combo) return null;
@@ -139,7 +162,7 @@ export async function getComboById(id: string) {
 export async function getComboByName(name: string) {
   const db = getDbInstance();
   const row = db
-    .prepare("SELECT data, sort_order, context_cache_protection FROM combos WHERE name = ?")
+    .prepare("SELECT id, data, sort_order, context_cache_protection FROM combos WHERE name = ?")
     .get(name);
   const combo = parseComboRow(row);
   if (!combo) return null;
@@ -155,7 +178,7 @@ export async function getComboByNameInsensitive(name: string) {
   const db = getDbInstance();
   const row = db
     .prepare(
-      "SELECT data, sort_order, context_cache_protection FROM combos WHERE name = ? COLLATE NOCASE"
+      "SELECT id, data, sort_order, context_cache_protection FROM combos WHERE name = ? COLLATE NOCASE"
     )
     .get(name);
   const combo = parseComboRow(row);
@@ -165,6 +188,11 @@ export async function getComboByNameInsensitive(name: string) {
 }
 
 export async function createCombo(data: JsonRecord) {
+  return insertComboRow(data);
+}
+
+/** Synchronous insert so batch writers can run it inside one `db.transaction`. */
+function insertComboRow(data: JsonRecord): JsonRecord {
   const db = getDbInstance();
   const now = new Date().toISOString();
   const sortOrder = typeof data.sortOrder === "number" ? data.sortOrder : getNextSortOrder();
@@ -198,7 +226,7 @@ export async function createCombo(data: JsonRecord) {
 export async function updateCombo(id: string, data: JsonRecord): Promise<ComboUpdateResult | null> {
   const db = getDbInstance();
   const existing = db
-    .prepare("SELECT data, sort_order, context_cache_protection FROM combos WHERE id = ?")
+    .prepare("SELECT id, data, sort_order, context_cache_protection FROM combos WHERE id = ?")
     .get(id);
   if (!existing) return null;
 
@@ -328,11 +356,110 @@ export async function reorderCombos(comboIds: string[]): Promise<ComboReorderRes
   };
 }
 
+function deleteComboRow(db: ReturnType<typeof getDbInstance>, id: string) {
+  const combo = db.prepare("SELECT name FROM combos WHERE id = ?").get(id) as
+    { name?: string } | undefined;
+  const result = db.prepare("DELETE FROM combos WHERE id = ?").run(id);
+  if (result.changes === 0)
+    return { deleted: false, name: combo?.name, lkgpKeys: [] as string[], purged: 0 };
+  // Purge the combo's proxy assignments and rotation cursor with the combo row
+  // (#14553, same shape as the account-scope purge in providers/deletion.ts
+  // for #9232): orphaned proxy_assignments rows would keep answering for a
+  // scope_id that no longer exists.
+  const purged = db
+    .prepare("DELETE FROM proxy_assignments WHERE scope = 'combo' AND scope_id IS ?")
+    .run(id).changes;
+  clearRotationState(db, "combo", id);
+  return {
+    deleted: true,
+    name: combo?.name,
+    lkgpKeys: combo?.name ? deleteLKGPRowsByComboName(combo.name) : ([] as string[]),
+    purged,
+  };
+}
+
 export async function deleteCombo(id: string) {
   const db = getDbInstance();
-  const result = db.prepare("DELETE FROM combos WHERE id = ?").run(id);
-  if (result.changes === 0) return false;
+  const deleteTransaction = db.transaction(() => {
+    const outcome = deleteComboRow(db, id);
+    // Grants are stored by name: revoke them with the row, or a combo recreated
+    // under the same name would inherit every key's old grant.
+    const revokedKeys =
+      outcome.deleted && outcome.name ? revokeComboGrantsByName(db, outcome.name).length : 0;
+    return { ...outcome, revokedKeys };
+  });
+
+  const { deleted, lkgpKeys, purged, revokedKeys } = deleteTransaction();
+  if (!deleted) return false;
+
+  if (revokedKeys > 0) {
+    const { clearApiKeyCaches } = await import("../apiKeys");
+    const { invalidateModelCatalogCache } = await import("../readCache");
+    clearApiKeyCaches();
+    invalidateModelCatalogCache();
+  }
+
+  if (purged > 0) {
+    bumpProxyRegistryGeneration();
+  }
+
+  if (lkgpKeys.length > 0) {
+    const { invalidateCachedLKGP } = await import("../readCache");
+    for (const key of lkgpKeys) {
+      invalidateCachedLKGP(key);
+    }
+  }
+
   return true;
+}
+
+export interface ComboImportBatchResult {
+  created: JsonRecord[];
+  removed: number;
+  lkgpKeys: string[];
+  revokedKeys: number;
+}
+
+/**
+ * Write a batch of already-validated combos in ONE transaction: any failure
+ * (UNIQUE name race, combo invariant) rolls back every insert and, with
+ * `replaceVisible`, every deletion. Hidden system-managed combos (quota pools)
+ * are never removed.
+ */
+export function importComboBatch(
+  entries: JsonRecord[],
+  options: { replaceVisible: boolean }
+): ComboImportBatchResult {
+  const db = getDbInstance();
+  const run = db.transaction(() => {
+    const lkgpKeys: string[] = [];
+    const removedNames: string[] = [];
+    let removed = 0;
+    let purged = 0;
+    if (options.replaceVisible) {
+      const rows = db.prepare("SELECT id, data FROM combos").all();
+      for (const row of rows) {
+        const combo = parseComboRow(row);
+        if (!combo || combo.isHidden === true || typeof combo.id !== "string") continue;
+        const outcome = deleteComboRow(db, combo.id);
+        if (!outcome.deleted) continue;
+        removed += 1;
+        purged += outcome.purged;
+        lkgpKeys.push(...outcome.lkgpKeys);
+        if (outcome.name) removedNames.push(outcome.name);
+      }
+    }
+    const created = entries.map((entry) => insertComboRow(entry));
+    // Revoke key grants only for names the file did not bring back: the helper
+    // skips names that exist again, so a replaced combo keeps its grants.
+    let revokedKeys = 0;
+    for (const name of removedNames) revokedKeys += revokeComboGrantsByName(db, name).length;
+    return { created, removed, lkgpKeys, purged, revokedKeys };
+  });
+
+  const { created, removed, lkgpKeys, purged, revokedKeys } = run();
+  if (purged > 0) bumpProxyRegistryGeneration();
+  return { created, removed, lkgpKeys, revokedKeys };
 }
 
 export const sqliteComboRepository: ComboRepository = {

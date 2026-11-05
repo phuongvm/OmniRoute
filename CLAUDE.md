@@ -3,15 +3,16 @@
 @AGENTS.md
 
 **All project rules live in [`AGENTS.md`](AGENTS.md)** — the single source of truth for every AI
-assistant (architecture, conventions, testing, quality gates, git workflow, the 22 Hard Rules,
+assistant (architecture, conventions, testing, quality gates, git workflow, the 23 Hard Rules,
 PII learnings). Read it in full; do not re-add project rules here. Everything below applies ONLY
 to Claude Code — operational refinements of rules already defined in `AGENTS.md`.
 
 ## Worktree isolation — Claude Code specifics
 
 The full mandatory worktree protocol (base-branch confirmation, `.claude/worktrees/` canonical
-path, `cp -al` node_modules, teardown rules) is in `AGENTS.md` → Git Workflow → "Worktree
-isolation". Claude-Code-specific points:
+path, `cp -al` node_modules, teardown rules) is in
+[`docs/ops/WORKTREE_ISOLATION.md`](docs/ops/WORKTREE_ISOLATION.md) (summarized in `AGENTS.md` →
+Git Workflow → "Worktree isolation"). Claude-Code-specific points:
 
 - Confirm the base branch with the operator via `AskUserQuestion` (Hard Rule #19) unless they
   already told you.
@@ -46,6 +47,21 @@ rewrite it to the `_tasks/…` equivalent before writing:
 | Hand-offs (`/handoff`)             | —                         | `_tasks/hands-off/<YYYY-MM-DD>_<branch>_v<versão>_sess-<id>/` |
 
 Commit those artifacts inside the `_tasks/` repo (`git -C _tasks …`), never in the main repo.
+
+## Scratch / temporary files — use `_artifacts/`, not `/tmp`
+
+This project overrides the harness's default session scratchpad (`/tmp/claude-*/…`). Write
+temporary/working files — exports, generated zips, one-off intermediate outputs, anything you'd
+otherwise put in `/tmp` — to `/home/diegosouzapw/dev/proxys/OmniRoute/_artifacts/` instead.
+
+- `_artifacts/` is a root `_*` path: already gitignored (`AGENTS.md` → "Root `_*` paths"), lives
+  on disk only, never tracked.
+- Reason: keeping scratch output inside the project (vs `/tmp`) makes it trivial for the operator
+  to find and delete everything temporary in one place, instead of hunting across ephemeral
+  session-specific `/tmp` directories that vanish or accumulate untracked.
+- Do **not** confuse this with `_tasks/` (Hard Rule #23, its own private git repo for durable
+  plans/specs/research/hand-offs) — `_artifacts/` is for disposable working files only, nothing
+  here needs to survive or be versioned.
 
 ## Base-green before opening PRs
 

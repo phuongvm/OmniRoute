@@ -1,5 +1,7 @@
 "use client";
 
+import type { RiskNoticeVariant } from "@/shared/constants/providers";
+
 // Phase 1t.5 extraction — Issue #3501
 // Pure composition of all modal elements rendered by ProviderDetailPageClient.
 import {
@@ -8,9 +10,11 @@ import {
   KiroOAuthWrapper,
   CursorAuthModal,
   TraeAuthModal,
-  RaycastAuthModal,
   ProxyConfigModal,
 } from "@/shared/components";
+// The barrel does not re-export the level union, so name it from the module
+// that owns it.
+import type { ProxyConfigLevel } from "@/shared/components/ProxyConfigModal";
 import RiskNoticeModal from "../../components/RiskNoticeModal";
 import CodexCliGuideModal from "../../components/CodexCliGuideModal";
 import SiliconFlowEndpointModal from "./SiliconFlowEndpointModal";
@@ -30,10 +34,12 @@ import { type BatchTestResults } from "../hooks/useProviderConnections";
 import { type ConnectionDeleteConfirmState } from "../hooks/useConnectionDeleteConfirm";
 import { type ImportProgress } from "../hooks/useModelImportHandlers";
 import { providerText, type ProviderMessageTranslator } from "../providerPageHelpers";
+import { resolveProviderOAuthBackendId } from "../../providerPageUtils";
 
 interface ProviderInfo {
   name: string;
-  riskNoticeVariant?: string;
+  oauthProviderId?: string;
+  riskNoticeVariant?: RiskNoticeVariant;
   website?: string;
   [key: string]: unknown;
 }
@@ -53,7 +59,7 @@ interface ProviderModalsPanelProps {
   isCommandCode: boolean;
   isUpstreamProxyProvider: boolean;
   subscriptionRisk: boolean;
-  existingConnectionCount?: number;
+  existingConnectionNames?: string[];
   // Risk notice
   showRiskNoticeModal: boolean;
   handleConfirmRiskNotice: () => void;
@@ -74,7 +80,7 @@ interface ProviderModalsPanelProps {
   // AddApiKey
   showAddApiKeyModal: boolean;
   siliconFlowInitialBaseUrl: string | undefined;
-  commandCodeAuthState: { phase: string; [key: string]: unknown };
+  commandCodeAuthState: import("../providerPageHelpers").CommandCodeAuthFlowState;
   handleStartCommandCodeAuth: () => void;
   handleSaveApiKey: (data: any) => Promise<void>;
   handleCloseAddApiKeyModal: () => void;
@@ -136,7 +142,7 @@ interface ProviderModalsPanelProps {
   // Proxy config
   proxyTarget: ProxyTarget | null;
   setProxyTarget: (t: ProxyTarget | null) => void;
-  fetchProxyConfig: () => Promise<void>;
+  refreshProxyState: () => Promise<void>;
   // Import progress
   importProgress: ImportProgress;
   showImportModal: boolean;
@@ -155,7 +161,7 @@ export default function ProviderModalsPanel({
   isCcCompatible,
   isUpstreamProxyProvider,
   subscriptionRisk,
-  existingConnectionCount,
+  existingConnectionNames,
   showRiskNoticeModal,
   handleConfirmRiskNotice,
   handleCancelRiskNotice,
@@ -220,7 +226,7 @@ export default function ProviderModalsPanel({
   emailsVisible,
   proxyTarget,
   setProxyTarget,
-  fetchProxyConfig,
+  refreshProxyState,
   importProgress,
   showImportModal,
   setShowImportModal,
@@ -228,11 +234,13 @@ export default function ProviderModalsPanel({
   setShowTutorialModal,
   t,
 }: ProviderModalsPanelProps) {
+  const oauthProviderId = resolveProviderOAuthBackendId(providerId, providerInfo);
+
   return (
     <>
       {showRiskNoticeModal && subscriptionRisk && (
         <RiskNoticeModal
-          variant={(providerInfo.riskNoticeVariant as string) ?? "oauth"}
+          variant={providerInfo.riskNoticeVariant ?? "oauth"}
           providerId={providerId}
           providerName={providerInfo.name}
           onConfirm={handleConfirmRiskNotice}
@@ -277,18 +285,11 @@ export default function ProviderModalsPanel({
             onSuccess={handleOAuthSuccess}
             onClose={() => setShowOAuthModal(false)}
           />
-        ) : providerId === "raycast" ? (
-          <RaycastAuthModal
-            isOpen={showOAuthModal}
-            reauthConnection={reauthConnection}
-            onSuccess={handleOAuthSuccess}
-            onClose={() => setShowOAuthModal(false)}
-          />
         ) : (
           <OAuthModal
             isOpen={showOAuthModal}
             reauthConnection={reauthConnection}
-            provider={providerId}
+            provider={oauthProviderId}
             providerInfo={providerInfo}
             onSuccess={handleOAuthSuccess}
             onClose={() => setShowOAuthModal(false)}
@@ -308,14 +309,16 @@ export default function ProviderModalsPanel({
           }}
         />
       )}
-      {!isUpstreamProxyProvider && (
+      {/* Mount only while open: closing drops the whole form, so a reopened
+          modal never shows the previous credentials. */}
+      {!isUpstreamProxyProvider && showAddApiKeyModal && (
         <AddApiKeyModal
           isOpen={showAddApiKeyModal}
           provider={providerId}
           providerName={providerInfo.name}
           providerWebsite={providerInfo.website}
           initialBaseUrl={siliconFlowInitialBaseUrl}
-          existingConnectionCount={existingConnectionCount}
+          existingConnectionNames={existingConnectionNames}
           isCompatible={isCompatible}
           isAnthropic={isAnthropicProtocolCompatible}
           isCcCompatible={isCcCompatible}
@@ -330,10 +333,10 @@ export default function ProviderModalsPanel({
         isOpen={batchDeleteConfirmOpen}
         onClose={() => setBatchDeleteConfirmOpen(false)}
         onConfirm={handleBatchDeleteConfirm}
-        title={t("batchDeleteConfirmTitle", "Delete connections")}
+        title={providerText(t, "batchDeleteConfirmTitle", "Delete connections")}
         message={t("batchDeleteConfirm", { count: selectedIds.size })}
-        confirmText={t("batchDeleteConfirmButton", "Delete")}
-        cancelText={t("cancel", "Cancel")}
+        confirmText={providerText(t, "batchDeleteConfirmButton", "Delete")}
+        cancelText={providerText(t, "cancel", "Cancel")}
         loading={batchDeleting}
       />
       <ConfirmModal
@@ -399,7 +402,7 @@ export default function ProviderModalsPanel({
           loading={externalLinkLoading}
           error={externalLinkError}
           url={externalLinkUrl}
-          copied={externalLinkCopied}
+          copied={externalLinkCopied ? "extlink" : false}
           onCopy={externalLinkCopy}
         />
       )}
@@ -444,11 +447,11 @@ export default function ProviderModalsPanel({
         <ProxyConfigModal
           isOpen={!!proxyTarget}
           onClose={() => setProxyTarget(null)}
-          level={proxyTarget.level}
+          level={proxyTarget.level as ProxyConfigLevel}
           levelId={proxyTarget.id}
           levelLabel={proxyTarget.label}
           onSaved={() => {
-            void fetchProxyConfig();
+            void refreshProxyState();
           }}
         />
       )}
@@ -456,7 +459,11 @@ export default function ProviderModalsPanel({
         importProgress={importProgress}
         isOpen={showImportModal}
         onClose={() => {
-          if (importProgress.phase === "done" || importProgress.phase === "error") {
+          if (
+            importProgress.phase === "done" ||
+            importProgress.phase === "error" ||
+            importProgress.phase === "warning"
+          ) {
             setShowImportModal(false);
           }
         }}

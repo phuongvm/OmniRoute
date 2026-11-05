@@ -21,7 +21,19 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { callVisionModel, type VisionModelConfig } from "@/lib/guardrails/visionBridgeHelpers";
+import {
+  callVisionModel as callVisionModelRaw,
+  type VisionModelConfig,
+} from "@/lib/guardrails/visionBridgeHelpers";
+
+// Inject the router's credential-check seam as INDETERMINATE (null): the fixed
+// model is used as-is and selection never touches the live connections DB — on a
+// clean box the suite otherwise dies with "No vision-capable provider connected",
+// and on a dev box auto-selection may swap the model under the assertions.
+const callVisionModel = (img: string, config: VisionModelConfig) =>
+  callVisionModelRaw(img, config, undefined, undefined, {
+    hasUsableCredentials: async () => null,
+  });
 
 const originalFetch = globalThis.fetch;
 
@@ -115,6 +127,37 @@ test("vision-bridge: falls back to reasoning_content when content is null", asyn
           message: {
             content: null,
             reasoning_content: reasoningText,
+          },
+        },
+      ],
+    }),
+  };
+
+  globalThis.fetch = async () => mockResponse as unknown as Response;
+
+  try {
+    const result = await callVisionModel(TINY_PNG, baseConfig());
+    assert.strictEqual(result, reasoningText);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("vision-bridge: falls back to plain `reasoning` when content is null (opencode gateway)", async () => {
+  // opencode-routed gateways name the reasoning field `reasoning` (not
+  // `reasoning_content`) — e.g. opencode/mimo-v2.5-free (#6623 / #10809).
+  // extractOpenAICompatibleContent must use it as the description.
+  const reasoningText =
+    "The image shows a young black Labrador puppy with golden-brown eyes sitting on weathered wooden planks.";
+  const mockResponse = {
+    ok: true,
+    json: async () => ({
+      choices: [
+        {
+          finish_reason: "length",
+          message: {
+            content: null,
+            reasoning: reasoningText,
           },
         },
       ],

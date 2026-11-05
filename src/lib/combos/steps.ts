@@ -25,6 +25,7 @@ export interface ComboModelStep {
   label?: string;
   prompt?: string | null;
   tags?: string[];
+  fallbackOnlyOnQuotaExhaustion?: boolean;
 }
 
 export interface ComboRefStep {
@@ -33,6 +34,7 @@ export interface ComboRefStep {
   comboName: string;
   weight: number;
   label?: string;
+  fallbackOnlyOnQuotaExhaustion?: boolean;
 }
 
 export interface ComboProviderWildcardStep {
@@ -141,10 +143,12 @@ function toFullModelString(model: string, providerId?: string | null): string {
 }
 
 function slugify(value: string): string {
+  // The first replace leaves at most one "-" at each edge, so the strip needs no quantifier
+  // (CodeQL #1165, js/polynomial-redos).
   const slug = value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .replace(/^-|-$/g, "");
   return slug.length > 0 ? slug : "step";
 }
 
@@ -200,6 +204,35 @@ export function getComboModelProvider(value: unknown): string | null {
     toTrimmedString(value.provider) ||
     parseProviderId(toTrimmedString(value.model) || "")
   );
+}
+
+/**
+ * A pin without an allowlist is still a pin. After 502/429 the credential
+ * loop drops forcedConnectionId; without a list it scans the whole provider
+ * pool. Treat a missing/undefined/empty allowlist as [connectionId] when a
+ * pin is present. With no pin, [] stays [] (comboStructure drops it, same
+ * as omitted: whole pool).
+ */
+export function implicitPinAllowlist(
+  connectionId: string | null | undefined,
+  allowedConnectionIds: string[] | null | undefined
+): string[] | null {
+  const pin = typeof connectionId === "string" ? connectionId.trim() : "";
+  if (Array.isArray(allowedConnectionIds) && allowedConnectionIds.length > 0) {
+    return allowedConnectionIds;
+  }
+  if (pin.length > 0) return [pin];
+  return Array.isArray(allowedConnectionIds) ? [] : null;
+}
+
+/** Combo steps pin-fail-closed. Header-forced connections keep sibling fallback. */
+export function comboPinAllowlist(
+  isCombo: boolean,
+  forcedConnectionId: string | null | undefined,
+  allowedConnectionIds: string[] | null | undefined
+): string[] | null {
+  if (!isCombo) return allowedConnectionIds ?? null;
+  return implicitPinAllowlist(forcedConnectionId, allowedConnectionIds);
 }
 
 export function getComboStepTarget(
@@ -287,6 +320,7 @@ export function normalizeComboStep(
   const weight = toWeight(value.weight);
   const label = toTrimmedString(value.label);
   const prompt = toTrimmedString(value.prompt);
+  const fallbackOnlyOnQuotaExhaustion = value.fallbackOnlyOnQuotaExhaustion === true;
 
   if (value.kind === "combo-ref") {
     const comboRefName = toTrimmedString(value.comboName);
@@ -297,6 +331,7 @@ export function normalizeComboStep(
       comboName: comboRefName,
       weight,
       ...(label ? { label } : {}),
+      ...(fallbackOnlyOnQuotaExhaustion ? { fallbackOnlyOnQuotaExhaustion: true } : {}),
     };
   }
 
@@ -409,6 +444,7 @@ export function normalizeComboStep(
     ...(prompt ? { prompt } : {}),
     ...(tags && tags.length > 0 ? { tags } : {}),
     ...(allowedConnectionIds && allowedConnectionIds.length > 0 ? { allowedConnectionIds } : {}),
+    ...(fallbackOnlyOnQuotaExhaustion ? { fallbackOnlyOnQuotaExhaustion: true } : {}),
   };
 }
 

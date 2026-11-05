@@ -111,6 +111,59 @@ function buildKiroToolSpecs(tools: KiroToolInput[]): {
 }
 
 /**
+ * Does this message carry Anthropic-style `tool_result` content blocks? Such a
+ * user message is part of an open tool-result batch rather than new user input.
+ */
+function carriesToolResults(msg): boolean {
+  return Array.isArray(msg?.content) && msg.content.some((c) => c.type === "tool_result");
+}
+
+/**
+ * Lookahead for issue #8903: is the text-only assistant message at `index`
+ * genuinely sandwiched inside a tool-result batch?
+ *
+ * True only when a later `tool` message (or a `tool_result` content block on a
+ * user message) still belongs to the same assistant turn — i.e. it appears
+ * before the conversation moves on with real user text or a new assistant
+ * tool-call turn. Consecutive text-only assistant messages are skipped so a
+ * `tool -> assistant -> assistant -> tool` run still counts as interleaved.
+ *
+ * Returning false for the ordinary `tool -> assistant(final reply)` shape is
+ * what keeps that reply on the normal flush path instead of being deferred.
+ */
+function hasFollowingToolResult(messages, index: number): boolean {
+  for (let j = index + 1; j < messages.length; j++) {
+    const next = messages[j];
+    if (next.role === "tool") return true;
+
+    if (next.role === "user") {
+      const blocks = Array.isArray(next.content) ? next.content : [];
+      // A user message carrying only tool_result blocks is still part of the
+      // batch; one with real text ends it.
+      if (blocks.some((c) => c.type === "tool_result")) {
+        const hasText = blocks.some((c) => (c.type === "text" || c.text) && c.text?.trim());
+        if (!hasText) return true;
+      }
+      return false;
+    }
+
+    if (next.role === "assistant") {
+      const isTextOnly =
+        (!next.tool_calls || next.tool_calls.length === 0) &&
+        !(Array.isArray(next.content) && next.content.some((c) => c.type === "tool_use"));
+      // Skip further text-only assistant messages; a new tool-call turn ends
+      // the current batch.
+      if (isTextOnly) continue;
+      return false;
+    }
+
+    // system or any other role ends the batch
+    return false;
+  }
+  return false;
+}
+
+/**
  * Convert OpenAI messages to Kiro format
  * Rules: system/tool/user -> user role, merge consecutive same roles
  */
@@ -121,10 +174,22 @@ function convertMessages(messages, tools, model) {
   let pendingUserContent = [];
   let pendingAssistantContent = [];
   let pendingToolResults = [];
+  // Text-only assistant turns that arrived in the middle of an open tool-result
+  // batch. They are held back so the batch stays contiguous, then emitted as
+  // their own assistant turn right after the batch flushes — see
+  // `interruptsOpenToolBatch` below (issue #8903).
+  let deferredAssistantContent: string[] = [];
   let pendingImages: Array<{ format: string; source: { bytes: string } }> = [];
   let currentRole = null;
   let toolsAttached = false;
   let toolDocs = "";
+  // The actual turn object that ends up carrying `toolDocs` (issue #13652).
+  // `buildKiroPayload()` only prepends the doc block onto `currentMessage`, so
+  // once this turn is demoted into `history` (any turn after the first, on a
+  // resent multi-turn request) we need to know it was NOT promoted, and embed
+  // the doc text directly onto it instead of letting it get re-glued onto
+  // whatever the newest turn happens to be.
+  let toolDocsCarrier = null;
 
   // Only Claude models support images in Kiro. Kiro also routes non-Claude
   // models (deepseek, minimax, glm, qwen3-coder-next) that do not accept image
@@ -184,7 +249,10 @@ function convertMessages(messages, tools, model) {
         }
         const built = buildKiroToolSpecs(tools);
         userMsg.userInputMessage.userInputMessageContext.tools = built.specs;
-        if (built.docs) toolDocs = built.docs;
+        if (built.docs) {
+          toolDocs = built.docs;
+          toolDocsCarrier = userMsg;
+        }
         toolsAttached = true;
       }
 
@@ -193,6 +261,19 @@ function convertMessages(messages, tools, model) {
       pendingUserContent = [];
       pendingToolResults = [];
       pendingImages = [];
+
+      // The tool batch is now closed, so any assistant text that was held back
+      // to keep it contiguous can be emitted as its own turn (issue #8903).
+      // Without this the deferred text would sit in a queue nothing drains and
+      // be silently dropped from the transcript.
+      if (deferredAssistantContent.length > 0) {
+        history.push({
+          assistantResponseMessage: {
+            content: deferredAssistantContent.join("\n\n").trim() || "(empty)",
+          },
+        });
+        deferredAssistantContent = [];
+      }
     } else if (currentRole === "assistant") {
       const content = pendingAssistantContent.join("\n\n").trim() || "(empty)";
       const assistantMsg = {
@@ -215,11 +296,64 @@ function convertMessages(messages, tools, model) {
     }
 
     // If role changes, flush pending
+    //
+    // Exception: a text-only assistant message must not split a batch of tool
+    // results that answers a single assistant turn. `tool` is normalized to
+    // `user` above, so `tool -> assistant -> tool` looks like two role changes
+    // and the interleaved flush would emit the first tool result and drop the
+    // rest, leaving advertised `toolUses` without matching `toolResults`.
+    // Bedrock rejects that transcript with 400 "Expected toolResult blocks"
+    // (issue #8903). Defer the assistant text instead so the tool batch stays
+    // contiguous; the text is re-emitted as its own assistant turn as soon as
+    // the batch flushes.
+    //
+    // The lookahead matters: without it, an ordinary trailing assistant reply
+    // (`tool -> assistant`, with no further tool message) would also be
+    // deferred and its text lost. Only a genuine sandwich qualifies.
+    const isTextOnlyAssistant =
+      msg.role === "assistant" &&
+      (!msg.tool_calls || msg.tool_calls.length === 0) &&
+      !(Array.isArray(msg.content) && msg.content.some((c) => c.type === "tool_use"));
+    const interruptsOpenToolBatch =
+      isTextOnlyAssistant &&
+      currentRole === "user" &&
+      pendingToolResults.length > 0 &&
+      hasFollowingToolResult(messages, i);
+
+    if (interruptsOpenToolBatch) {
+      const deferredText =
+        typeof msg.content === "string"
+          ? msg.content.trim()
+          : Array.isArray(msg.content)
+            ? msg.content
+                .filter((c) => c.type === "text" || c.text)
+                .map((c) => c.text || "")
+                .join("\n")
+                .trim()
+            : "";
+      if (deferredText) deferredAssistantContent.push(deferredText);
+      continue;
+    }
+
+    // Once assistant text has been deferred, the tool batch is logically over
+    // as soon as a message arrives that is not itself a tool result. Flush now
+    // so the pending batch + deferred assistant turn are emitted before the new
+    // user text, instead of that text merging into the tool-result turn and
+    // leaving the deferred reply stranded after it (issue #8903).
+    if (
+      deferredAssistantContent.length > 0 &&
+      currentRole === "user" &&
+      msg.role !== "tool" &&
+      !carriesToolResults(msg)
+    ) {
+      flushPending();
+      currentRole = null;
+    }
+
     if (role !== currentRole && currentRole !== null) {
       flushPending();
     }
     currentRole = role;
-
     if (role === "user") {
       // Extract content
       let content = "";
@@ -406,8 +540,28 @@ function convertMessages(messages, tools, model) {
     }
     const built = buildKiroToolSpecs(tools);
     currentMessage.userInputMessage.userInputMessageContext.tools = built.specs;
-    if (built.docs) toolDocs = built.docs;
+    if (built.docs) {
+      toolDocs = built.docs;
+      toolDocsCarrier = currentMessage;
+    }
     toolsAttached = true;
+  }
+
+  // The relocated doc text is only safe to leave in `toolDocs` (which
+  // `buildKiroPayload()` unconditionally prepends onto `currentMessage`) when
+  // the turn that originally carried it IS `currentMessage` — true for a
+  // single-turn conversation and the "no user turn" fallback above. On any
+  // later turn of a resent multi-turn request, the tool-bearing turn has been
+  // demoted into `history` instead, so re-prepending `toolDocs` here would
+  // glue the *already delivered* doc block onto the newest turn every time
+  // (issue #13652). Embed it directly onto the carrier turn's own content —
+  // still in `history` at this point — and clear `toolDocs` so
+  // `buildKiroPayload()` does not also inject it.
+  if (toolDocs && toolDocsCarrier && toolDocsCarrier !== currentMessage) {
+    const carrierMessage = toolDocsCarrier.userInputMessage;
+    const existingContent = carrierMessage.content || "";
+    carrierMessage.content = `# Tool Documentation\n\n${toolDocs}\n\n---\n\n${existingContent}`;
+    toolDocs = "";
   }
 
   // Clean up history for Kiro API compatibility
@@ -580,6 +734,51 @@ function convertMessages(messages, tools, model) {
     }
   }
 
+  // Strip orphaned toolUses: an assistantResponseMessage that advertises a
+  // toolUse with no matching toolResult anywhere in history (or the current
+  // message) produces an invalid Kiro/Bedrock transcript -- Bedrock rejects it
+  // with "Expected toolResult blocks at messages.N.content for the following
+  // Ids: ...". This mirrors the orphaned-toolResult cleanup above, but for the
+  // opposite direction (a tool_use that never got answered, e.g. because the
+  // client lost one of two parallel tool results). The same defense
+  // (fixToolPairs, open-sse/services/contextManager.ts) already applies on the
+  // Claude and post-#7822 Antigravity paths; KiroExecutor.execute() never
+  // calls BaseExecutor.execute(), so it never got this guard.
+  const answeredToolUseIds = new Set<string>();
+  for (const item of mergedHistory) {
+    const toolResults = item.userInputMessage?.userInputMessageContext?.toolResults as
+      | Array<{ toolUseId?: string }>
+      | undefined;
+    if (Array.isArray(toolResults)) {
+      for (const result of toolResults) {
+        if (result?.toolUseId) answeredToolUseIds.add(result.toolUseId);
+      }
+    }
+  }
+  const currentToolResultsForOrphanCheck = currentMessage?.userInputMessage
+    ?.userInputMessageContext?.toolResults as Array<{ toolUseId?: string }> | undefined;
+  if (Array.isArray(currentToolResultsForOrphanCheck)) {
+    for (const result of currentToolResultsForOrphanCheck) {
+      if (result?.toolUseId) answeredToolUseIds.add(result.toolUseId);
+    }
+  }
+  for (const item of mergedHistory) {
+    const toolUses = item.assistantResponseMessage?.toolUses as
+      | Array<{ toolUseId?: string }>
+      | undefined;
+    if (!Array.isArray(toolUses)) continue;
+    const filtered = toolUses.filter(
+      (use) => use?.toolUseId && answeredToolUseIds.has(use.toolUseId)
+    );
+    if (filtered.length !== toolUses.length) {
+      if (filtered.length > 0) {
+        item.assistantResponseMessage!.toolUses = filtered;
+      } else {
+        delete item.assistantResponseMessage!.toolUses;
+      }
+    }
+  }
+
   // Ensure alternating roles by inserting synthetic assistant messages
   // between consecutive user turns that couldn't be merged.
   const alternatingHistory: typeof mergedHistory = [];
@@ -708,6 +907,9 @@ export function buildKiroPayload(model, body, stream, credentials) {
   // so Kiro accepts the request instead of returning `Improperly formed
   // request`. This preserves tool-call history and is a no-op when body.tools
   // is already populated.
+  // The synthesized names are recorded because the client never declared them
+  // (#18675): the executor must not read a synthesized `tool_call` as a client tool.
+  let synthesizedToolNames: string[] = [];
   if (tools.length === 0) {
     const seen = new Set<string>();
     const synthesized: Array<Record<string, unknown>> = [];
@@ -742,6 +944,7 @@ export function buildKiroPayload(model, body, stream, credentials) {
     }
     if (synthesized.length > 0) {
       tools = synthesized;
+      synthesizedToolNames = [...seen];
     }
   }
 
@@ -781,6 +984,7 @@ export function buildKiroPayload(model, body, stream, credentials) {
       history: unknown[];
     };
     profileArn?: string;
+    _kiroSynthesizedToolNames?: Map<string, true>;
     inferenceConfig?: {
       maxTokens?: number;
       temperature?: number;
@@ -854,6 +1058,11 @@ export function buildKiroPayload(model, body, stream, credentials) {
 
   if (profileArn) {
     payload.profileArn = profileArn;
+  }
+  // In-memory channel (Map, like `_toolNameMap`): survives post-translation compression and
+  // is dropped by the Kiro executor's transformRequest allowlist before the wire send.
+  if (synthesizedToolNames.length > 0) {
+    payload._kiroSynthesizedToolNames = new Map(synthesizedToolNames.map((n) => [n, true]));
   }
 
   if (maxTokens || temperature !== undefined || topP !== undefined) {

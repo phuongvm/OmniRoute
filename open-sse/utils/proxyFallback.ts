@@ -10,8 +10,10 @@
 
 import { fetch as undiciFetch } from "undici";
 import { createProxyDispatcher, normalizeProxyUrl } from "./proxyDispatcher.ts";
-import { resolveProxyForScopeFromRegistry, listProxies, listOneproxyProxies } from "@/lib/localDb";
-import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { resolveProxyForScopeFromRegistry, listProxies } from "@/lib/db/proxies";
+import { listOneproxyProxies } from "@/lib/db/oneproxy";
+import { decodeUserinfo } from "@/shared/utils/decodeUserinfo";
+import { isRegisteredFeatureFlagEnabled } from "./registeredFeatureFlag.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -406,7 +408,7 @@ export async function selectWorkingProxyFallback(_connectionId?: string): Promis
   // registry silently becomes a global fallback for ALL connections (ignoring
   // assignments / per-connection proxy_enabled). Default OFF — only run when the
   // operator explicitly enables PROXY_AUTO_SELECT_ENABLED.
-  if (!isFeatureFlagEnabled("PROXY_AUTO_SELECT_ENABLED")) return null;
+  if (!isRegisteredFeatureFlagEnabled("PROXY_AUTO_SELECT_ENABLED")) return null;
 
   const candidates = await getProxyCandidates();
   if (candidates.length === 0) return null;
@@ -426,8 +428,8 @@ export async function selectWorkingProxyFallback(_connectionId?: string): Promis
         type: url.protocol.replace(":", "") || "http",
         host: url.hostname,
         port: parseInt(url.port, 10) || (url.protocol === "https:" ? 443 : 80),
-        username: url.username ? decodeURIComponent(url.username) : "",
-        password: url.password ? decodeURIComponent(url.password) : "",
+        username: url.username ? decodeUserinfo(url.username) : "",
+        password: url.password ? decodeUserinfo(url.password) : "",
       },
       level: "autoSelect",
       levelId: null,

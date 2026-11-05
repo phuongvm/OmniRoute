@@ -5,11 +5,14 @@
  * The baseline (`FREE_MODEL_BUDGETS`) is NEVER mutated.
  *
  * Merge rules:
- *  1. Feed never overwrites a local override.
+ *  1. Feed never overwrites a local override, except the safety-critical
+ *     `enabled:false` signal for an upstream model confirmed unavailable.
  *  2. `enabled:false` disables the entry with `disabledBy: "radar"` provenance.
  *  3. User-added entry NOT in the feed survives untouched.
  *  4. User deletion tombstone prevents feed from resurrecting the entry.
  */
+
+import type { RadarLocalizedText } from "./feedSchema";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,6 +27,8 @@ export interface MergedEntry {
   provider: string;
   modelId: string;
   displayName: string;
+  /** Curated cross-provider model family used for Radar combo suggestions. */
+  familyId?: string | null;
   monthlyTokens: number;
   creditTokens: number;
   freeType:
@@ -37,6 +42,8 @@ export interface MergedEntry {
   poolKey: string | null;
   tos: "ok" | "caution" | "ambiguous" | "avoid" | "unknown";
   trainsOnPrompts?: boolean;
+  /** Set when the quota only opens after a region-bound identity check; counted apart. */
+  eligibilityGate?: "regional-identity";
   /** Whether the entry is enabled for use. Defaults to true. */
   enabled?: boolean;
   /**
@@ -51,6 +58,32 @@ export interface MergedEntry {
    * Absent for entries disabled by other means or still enabled.
    */
   disabledBy?: "radar";
+  /**
+   * Context window size in tokens. Only present on entries that carry feed
+   * data (origin "radar"/"local" merged from a feed entry); undefined for
+   * baseline-only entries.
+   */
+  contextWindow?: number | null;
+  /** Capability flags reported by the feed. Undefined for baseline-only entries. */
+  capabilities?: {
+    tools: boolean | null;
+    vision: boolean | null;
+    thinking: boolean | null;
+  };
+  /** Credential-free HTTPS evidence for non-null context/capability facts. */
+  metadataEvidenceUrls?: string[];
+  /** Rate/quota limits reported by the feed. Undefined for baseline-only entries. */
+  limits?: {
+    rpm: number | null;
+    rpd: number | null;
+    tpm: number | null;
+    tpd: number | null;
+  };
+  /** Setup guide (key URL + steps) reported by the feed. Undefined for baseline-only entries. */
+  setup?: {
+    keyUrl: string | null;
+    steps: RadarLocalizedText[];
+  } | null;
 }
 
 /**
@@ -75,15 +108,18 @@ export interface FeedModel {
   };
   contextWindow: number | null;
   capabilities: {
-    tools: boolean;
-    vision: boolean;
-    thinking: boolean;
+    tools: boolean | null;
+    vision: boolean | null;
+    thinking: boolean | null;
   };
+  metadataEvidenceUrls?: string[];
   trainsOnPrompts: boolean | null;
   tosRisk: MergedEntry["tos"];
+  /** Absent = the feed does not know; null = explicitly no gate. */
+  eligibilityGate?: "regional-identity" | null;
   setup: {
     keyUrl: string | null;
-    steps: string[];
+    steps: RadarLocalizedText[];
   } | null;
   enabled: boolean;
 }
@@ -103,9 +139,7 @@ function entryKey(provider: string, modelId: string): string {
  * Convert a FeedModel budget into a `monthlyTokens` number compatible
  * with the baseline catalog shape.
  */
-function feedBudgetToMonthlyTokens(
-  budget: FeedModel["budget"],
-): number {
+function feedBudgetToMonthlyTokens(budget: FeedModel["budget"]): number {
   if (budget.kind === "per_model") return budget.tokensPerMonth;
   if (budget.kind === "shared_pool") return budget.tokensPerMonth;
   return 0; // rate_only
@@ -114,9 +148,7 @@ function feedBudgetToMonthlyTokens(
 /**
  * Convert a FeedModel budget into a `poolKey` compatible with the baseline.
  */
-function feedBudgetToPoolKey(
-  budget: FeedModel["budget"],
-): string | null {
+function feedBudgetToPoolKey(budget: FeedModel["budget"]): string | null {
   if (budget.kind === "shared_pool") return budget.poolId;
   return null;
 }
@@ -182,8 +214,7 @@ export function applyFeed(input: ApplyFeedInput): MergedEntry[] {
     const overrides = localOverrides.get(key);
 
     if (!feedEntry) {
-      // No feed entry: baseline passes through (rule 3: user-added survives)
-      resultMap.set(key, { ...baseEntry });
+      resultMap.set(key, applyLocalOverrideToBaseEntry(baseEntry, overrides));
       continue;
     }
 
@@ -211,6 +242,24 @@ export function applyFeed(input: ApplyFeedInput): MergedEntry[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * Baseline entry with NO feed counterpart: still honour a local override
+ * (e.g. enabled:false) and mark the origin, so `computeFreeModelTotals` sees
+ * the operator's state even when the feed does not mention this baseline
+ * entry. Without an override, the baseline passes through untouched
+ * (rule 3: user-added survives).
+ */
+function applyLocalOverrideToBaseEntry(
+  baseEntry: MergedEntry,
+  overrides: Partial<MergedEntry> | undefined
+): MergedEntry {
+  if (!overrides) return { ...baseEntry };
+  const localEntry: MergedEntry = { ...baseEntry, origin: "local" as const };
+  if (overrides.displayName !== undefined) localEntry.displayName = overrides.displayName;
+  if (overrides.enabled !== undefined) localEntry.enabled = overrides.enabled;
+  return localEntry;
+}
+
+/**
  * Merge a single baseline entry with a feed entry and optional local overrides.
  * Rule 1: local overrides take precedence over feed values.
  * Rule 2: feed `enabled: false` disables with provenance.
@@ -218,7 +267,7 @@ export function applyFeed(input: ApplyFeedInput): MergedEntry[] {
 function mergeOne(
   base: MergedEntry,
   feed: FeedModel,
-  overrides: Partial<MergedEntry> | undefined,
+  overrides: Partial<MergedEntry> | undefined
 ): MergedEntry {
   // Start from baseline
   const result: MergedEntry = { ...base };
@@ -236,6 +285,9 @@ function mergeOne(
   if (!overriddenKeys.has("displayName")) {
     result.displayName = feed.displayName;
   }
+  if (!overriddenKeys.has("familyId")) {
+    result.familyId = feed.familyId;
+  }
   if (!overriddenKeys.has("monthlyTokens")) {
     result.monthlyTokens = feedBudgetToMonthlyTokens(feed.budget);
   }
@@ -251,20 +303,54 @@ function mergeOne(
   if (!overriddenKeys.has("trainsOnPrompts")) {
     result.trainsOnPrompts = feed.trainsOnPrompts ?? undefined;
   }
+  // Absent means "this feed predates the field": keep whatever the baseline says.
+  // An explicit null is the feed clearing the gate.
+  if (!overriddenKeys.has("eligibilityGate") && feed.eligibilityGate !== undefined) {
+    result.eligibilityGate = feed.eligibilityGate ?? undefined;
+  }
   if (!overriddenKeys.has("creditTokens")) {
     // Feed doesn't have creditTokens; keep baseline
+  }
+  if (!overriddenKeys.has("contextWindow")) {
+    result.contextWindow = feed.contextWindow;
+  }
+  if (!overriddenKeys.has("capabilities")) {
+    result.capabilities = feed.capabilities;
+  }
+  result.metadataEvidenceUrls =
+    overriddenKeys.has("contextWindow") || overriddenKeys.has("capabilities")
+      ? []
+      : (feed.metadataEvidenceUrls ?? []);
+  if (!overriddenKeys.has("limits")) {
+    result.limits = feed.limits;
+  }
+  if (!overriddenKeys.has("setup")) {
+    result.setup = feed.setup;
   }
 
   // Apply local overrides (rule 1: they win)
   if (overrides) {
     if (overrides.displayName !== undefined) result.displayName = overrides.displayName;
+    if (overrides.familyId !== undefined) result.familyId = overrides.familyId;
     if (overrides.monthlyTokens !== undefined) result.monthlyTokens = overrides.monthlyTokens;
     if (overrides.creditTokens !== undefined) result.creditTokens = overrides.creditTokens;
     if (overrides.freeType !== undefined) result.freeType = overrides.freeType;
     if (overrides.poolKey !== undefined) result.poolKey = overrides.poolKey;
     if (overrides.tos !== undefined) result.tos = overrides.tos;
     if (overrides.trainsOnPrompts !== undefined) result.trainsOnPrompts = overrides.trainsOnPrompts;
+    if (overrides.eligibilityGate !== undefined) result.eligibilityGate = overrides.eligibilityGate;
     if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
+    if (overrides.contextWindow !== undefined) result.contextWindow = overrides.contextWindow;
+    if (overrides.capabilities !== undefined) result.capabilities = overrides.capabilities;
+    if (overrides.limits !== undefined) result.limits = overrides.limits;
+    if (overrides.setup !== undefined) result.setup = overrides.setup;
+  }
+
+  // Safety exception to rule 1: a model confirmed unavailable upstream is
+  // never resurrected by a stale local enabled:true override.
+  if (!feed.enabled) {
+    result.enabled = false;
+    result.disabledBy = "radar";
   }
 
   // Origin: "local" if user has overrides, else "radar" (feed updated it)
@@ -278,22 +364,39 @@ function mergeOne(
  */
 function feedModelToMerged(
   feed: FeedModel,
-  overrides: Partial<MergedEntry> | undefined,
+  overrides: Partial<MergedEntry> | undefined
 ): MergedEntry {
+  const metadataOverridden =
+    overrides !== undefined &&
+    (Object.hasOwn(overrides, "contextWindow") || Object.hasOwn(overrides, "capabilities"));
   const entry: MergedEntry = {
     provider: feed.provider,
     modelId: feed.modelId,
     displayName: overrides?.displayName ?? feed.displayName,
+    familyId: overrides?.familyId ?? feed.familyId,
     monthlyTokens: overrides?.monthlyTokens ?? feedBudgetToMonthlyTokens(feed.budget),
     creditTokens: overrides?.creditTokens ?? 0,
     freeType: overrides?.freeType ?? feed.freeType,
     poolKey: overrides?.poolKey ?? feedBudgetToPoolKey(feed.budget),
+    eligibilityGate: overrides?.eligibilityGate ?? feed.eligibilityGate ?? undefined,
     tos: overrides?.tos ?? feed.tosRisk,
-    trainsOnPrompts: overrides?.trainsOnPrompts ?? (feed.trainsOnPrompts ?? undefined),
-    enabled: overrides?.enabled ?? feed.enabled,
+    trainsOnPrompts: overrides?.trainsOnPrompts ?? feed.trainsOnPrompts ?? undefined,
+    enabled: feed.enabled ? (overrides?.enabled ?? true) : false,
     origin: overrides ? "local" : "radar",
+    contextWindow:
+      overrides !== undefined && Object.hasOwn(overrides, "contextWindow")
+        ? (overrides.contextWindow ?? null)
+        : feed.contextWindow,
+    capabilities:
+      overrides !== undefined && Object.hasOwn(overrides, "capabilities")
+        ? (overrides.capabilities ?? feed.capabilities)
+        : feed.capabilities,
+    metadataEvidenceUrls: metadataOverridden ? [] : (feed.metadataEvidenceUrls ?? []),
+    limits: overrides?.limits ?? feed.limits,
+    setup: overrides?.setup ?? feed.setup,
   };
 
+  // Rule 2 is the safety exception to local override precedence.
   if (!feed.enabled) {
     entry.enabled = false;
     entry.disabledBy = "radar";

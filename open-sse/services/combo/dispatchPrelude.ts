@@ -12,17 +12,32 @@
  *
  * Extracted from combo.ts as a pure move (#3501). No behaviour change.
  */
-import { getCachedProviderConnections } from "../../../src/lib/db/readCache";
+import { cloneForQuality } from "./preContentTransportFailure.ts";
+import { getCachedProviderPoolConnections } from "../providerConnectionPool.ts";
 import { getCircuitBreaker } from "../../../src/shared/utils/circuitBreaker";
 import { fisherYatesShuffle, getNextFromDeck } from "../../../src/shared/utils/shuffleDeck";
 import { handleFusionChat, type FusionTuning } from "../fusion.ts";
+import { handleAgenticPipelineChat, type AgenticOrchestrationConfig } from "../agenticPipeline.ts";
+import { getResolvedModelCapabilities } from "../modelCapabilities.ts";
+import { errorResponse, errorResponseWithComboDiagnostics } from "../../utils/error.ts";
 import { parseModel } from "../model.ts";
 import { handlePipelineChat, type PipelineStep } from "../pipeline.ts";
 import type { resolveComboSetupConfig } from "../comboConfig.ts";
-import { clampComboDepth, MAX_GLOBAL_ATTEMPTS, resolveDelayMs } from "./comboPredicates.ts";
-import { resolveComboRuntimeUnits, resolveComboTargets } from "./comboStructure.ts";
+import { clampComboDepth, clampGlobalAttempts, resolveDelayMs } from "./comboPredicates.ts";
+import {
+  deriveRequestCompatibilityRequirements,
+  isVisionIncompatibleTarget,
+  resolveComboRuntimeUnits,
+  resolveComboTargets,
+} from "./comboStructure.ts";
 import { isComboModelVisible } from "./comboVisibility.ts";
 import { buildFusionHandleSingleModel, extractFusionPanelSpec } from "./fusionPanel.ts";
+import { expandTargetsForAllStrategies } from "./connectionAwareExpansion.ts";
+import { buildAllTargetsCoolingDownResponse, type PreDispatchExclusion } from "./pinRecovery.ts";
+import {
+  expandComboSystemPromptIfPresent,
+  resolveTargetFingerprint,
+} from "../comboAgentMiddleware.ts";
 import {
   clampStickyWeightedTargetLimit,
   getStickyRoundRobinStartIndex,
@@ -38,6 +53,9 @@ import {
   releaseRejectedQualityResponse,
   validateResponseQuality,
 } from "./validateQuality.ts";
+import { isTrustedEmptyTurn } from "./emptyTurnTrust.ts";
+import { AGENTIC_STALL_COMBO_REASON, isAgenticStallComboAttempt } from "./agenticStallFailover.ts";
+import { getStrategyTraits } from "./strategyRegistry.ts";
 import type {
   ComboCollectionLike,
   ComboLike,
@@ -51,6 +69,7 @@ import type {
   ResolvedComboUnit,
   SingleModelTarget,
 } from "./types.ts";
+import type { PerTargetAdmissionHook } from "../admission/types.ts";
 
 type ComboSetupConfig = ReturnType<typeof resolveComboSetupConfig>;
 type RunCombo = (options: HandleComboChatOptions) => Promise<Response>;
@@ -60,6 +79,7 @@ type RunCombo = (options: HandleComboChatOptions) => Promise<Response>;
  * hand back to it when it dispatches a nested combo-ref.
  */
 type PreludeBaseOptionArgs = {
+  invocationId?: string;
   body: Record<string, unknown>;
   combo: ComboLike;
   handleSingleModel: HandleSingleModel;
@@ -71,6 +91,17 @@ type PreludeBaseOptionArgs = {
   signal?: AbortSignal | null;
   apiKeyAllowedConnections?: string[] | null;
   hiddenModelsByProvider?: HiddenModelsByProvider;
+  clientManagedResponsesContext?: boolean;
+  /** #9654 Wave 2: per-target lane-aware admission probe (see HandleComboChatOptions). */
+  perTargetAdmission?: PerTargetAdmissionHook | null;
+  /** #10225 — defer the hard context-overflow preflight when compression is enabled. */
+  deferContextOverflowWhenCompressible?: boolean;
+  /** Server-side compression exclusions (#8034). */
+  compressionExclusions?: import("../compression/exclusions.ts").CompressionExclusions;
+  /** #10503 — request-shape facts for the target-aware deferral check (see knownContextOverflow.ts). */
+  sourceFormat?: string | null;
+  endpointPath?: string | null;
+  requestHeaders?: Headers | Record<string, unknown> | null;
 };
 
 /** Rebuild handleComboChat's option bag verbatim for a recursive dispatch. */
@@ -87,6 +118,14 @@ function buildBaseOptions(a: PreludeBaseOptionArgs): HandleComboChatOptions {
     signal: a.signal,
     apiKeyAllowedConnections: a.apiKeyAllowedConnections,
     hiddenModelsByProvider: a.hiddenModelsByProvider,
+    invocationId: a.invocationId,
+    clientManagedResponsesContext: a.clientManagedResponsesContext,
+    perTargetAdmission: a.perTargetAdmission,
+    deferContextOverflowWhenCompressible: a.deferContextOverflowWhenCompressible,
+    compressionExclusions: a.compressionExclusions,
+    sourceFormat: a.sourceFormat,
+    endpointPath: a.endpointPath,
+    requestHeaders: a.requestHeaders,
   };
 }
 
@@ -142,7 +181,7 @@ async function isPinnedModelDurablyUnhealthy(pinnedModel: string): Promise<boole
     const provider = parseModel(pinnedModel).provider;
     if (!provider) return false;
     const circuitState = getCircuitBreaker(provider)?.getStatus?.()?.state;
-    const connections = (await getCachedProviderConnections({
+    const connections = (await getCachedProviderPoolConnections({
       provider,
       isActive: true,
     })) as Array<{
@@ -160,7 +199,7 @@ export function normalizeNestedComboMode(value: unknown): NestedComboMode {
   return value === "execute" ? "execute" : "flatten";
 }
 
-function buildDefaultNesting(
+export function buildDefaultNesting(
   nesting: ComboNestingContext | null | undefined,
   comboName: string,
   config: ComboSetupConfig
@@ -171,9 +210,16 @@ function buildDefaultNesting(
       maxDepth: clampComboDepth(config.maxComboDepth),
       visitedComboNames: [comboName],
       rootComboName: comboName,
-      attemptBudget: { count: 0, limit: MAX_GLOBAL_ATTEMPTS },
+      // #11134: honor the operator-configured shared budget (clamped to the
+      // hard cap) instead of the hardcoded MAX_GLOBAL_ATTEMPTS.
+      attemptBudget: { count: 0, limit: clampGlobalAttempts(config.maxGlobalAttempts) },
     }
   );
+}
+
+/** True once the client went away while pre-content transport recovery is in charge. */
+function recoveryAborted(recovery: boolean | undefined, signal?: AbortSignal | null): boolean {
+  return recovery === true && signal?.aborted === true;
 }
 
 /**
@@ -182,43 +228,148 @@ function buildDefaultNesting(
  * strategy (200-but-empty, or a transient upstream status worth failing over).
  */
 async function evaluatePinnedResponse(args: {
+  body: Record<string, unknown>;
   pinnedResult: Response;
   pinnedModel: string;
+  hasOtherTargets: boolean;
   clientRequestedStream: boolean;
   config: ComboSetupConfig;
   log: ComboLogger;
+  preContentTransportRecovery?: boolean;
+  signal?: AbortSignal | null;
 }): Promise<Response | null> {
-  const { pinnedResult, pinnedModel, clientRequestedStream, config, log } = args;
+  const {
+    body,
+    pinnedResult,
+    pinnedModel,
+    hasOtherTargets,
+    clientRequestedStream,
+    config,
+    log,
+    preContentTransportRecovery,
+    signal,
+  } = args;
   if (pinnedResult.ok) {
-    let pinnedClone: Response;
-    try {
-      pinnedClone = pinnedResult.clone();
-    } catch {
-      pinnedClone = pinnedResult;
-    }
+    const pinnedClone = cloneForQuality(pinnedResult);
     const pinnedQuality = await validateResponseQuality(
       pinnedClone,
       clientRequestedStream,
       log,
-      config.responseValidation
+      config.responseValidation,
+      preContentTransportRecovery ? signal : null,
+      await isTrustedEmptyTurn(parseModel(pinnedModel).provider, pinnedResult),
+      preContentTransportRecovery
     );
     releaseQualityClone(pinnedClone, pinnedResult, pinnedQuality);
-    if (pinnedQuality.valid) return pinnedResult;
+    if (recoveryAborted(preContentTransportRecovery, signal)) {
+      void pinnedQuality.clonedResponse?.body?.cancel().catch(() => {});
+      releaseRejectedQualityResponse(pinnedClone, pinnedResult);
+      return errorResponse(499, "Client disconnected");
+    }
+    // #13954 (opt-in): a stalled pin gives the turn back to the combo strategy.
+    const pinnedStalled =
+      pinnedQuality.valid &&
+      (await isAgenticStallComboAttempt({
+        body,
+        result: pinnedResult,
+        modelStr: pinnedModel,
+        hasNextTarget: hasOtherTargets,
+        log,
+      }));
+    if (pinnedQuality.valid && !pinnedStalled) return pinnedResult;
     releaseRejectedQualityResponse(pinnedClone, pinnedResult);
     log.warn(
       "COMBO",
-      `Pinned model ${pinnedModel} returned 200 but failed quality check: ${pinnedQuality.reason}, falling through to combo retry/fallback`
+      `Pinned model ${pinnedModel} returned 200 but ${pinnedStalled ? AGENTIC_STALL_COMBO_REASON : `failed quality check: ${pinnedQuality.reason}`}, falling through to combo retry/fallback`
     );
     return null;
   }
   const pinnedStatus = pinnedResult.status || 500;
-  if (![408, 429, 500, 502, 503, 504].includes(pinnedStatus)) {
+  if (![401, 408, 429, 500, 502, 503, 504].includes(pinnedStatus)) {
     return pinnedResult;
   }
   log.warn(
     "COMBO",
     `Pinned model ${pinnedModel} failed (${pinnedStatus}), falling through to combo retry/fallback`
   );
+  return null;
+}
+
+/**
+ * Dispatch to the honored pin and decide whether its response is served. Returns the response to
+ * serve (including a 499 when the client went away), or null to fall through to the combo strategy.
+ */
+async function dispatchHonoredPin(args: {
+  body: Record<string, unknown>;
+  combo: ComboLike;
+  pinnedModel: string;
+  comboTargets: ReturnType<typeof resolveComboTargets>;
+  config: ComboSetupConfig;
+  clientRequestedStream: boolean;
+  handleSingleModelWithTimeout: HandleSingleModel;
+  log: ComboLogger;
+  preContentTransportRecovery: boolean;
+  signal?: AbortSignal | null;
+}): Promise<Response | null> {
+  const {
+    body,
+    combo,
+    pinnedModel,
+    comboTargets,
+    config,
+    clientRequestedStream,
+    handleSingleModelWithTimeout,
+    log,
+    preContentTransportRecovery,
+    signal,
+  } = args;
+  let pinnedResult: Response | null = null;
+  try {
+    // #5501: the combo system_message also expands on the pinned context path —
+    // a session pin bypasses the main loop, so without this the template would
+    // go literal from the second in-session request on. Target context comes
+    // from the pinned model's resolved combo target when available.
+    const pinnedTarget = comboTargets.find((t) => t.modelStr === pinnedModel);
+    const pinnedBody = expandComboSystemPromptIfPresent(body, combo, {
+      modelId: pinnedModel,
+      providerId: pinnedTarget && pinnedTarget.provider !== "unknown" ? pinnedTarget.provider : "",
+      account:
+        typeof pinnedTarget?.label === "string" && pinnedTarget.label.trim().length > 0
+          ? pinnedTarget.label.trim()
+          : "",
+      fingerprint: pinnedTarget ? (resolveTargetFingerprint(pinnedTarget) ?? "") : "",
+    });
+    if (recoveryAborted(preContentTransportRecovery, signal))
+      return errorResponse(499, "Client disconnected");
+    pinnedResult = await handleSingleModelWithTimeout(pinnedBody, pinnedModel, {
+      modelPinned: true,
+    } as SingleModelTarget);
+  } catch (pinErr) {
+    if (recoveryAborted(preContentTransportRecovery, signal))
+      return errorResponse(499, "Client disconnected");
+    log.warn(
+      "COMBO",
+      `Pinned model ${pinnedModel} threw error: ${pinErr instanceof Error ? pinErr.message : String(pinErr)}, falling through to combo retry/fallback`
+    );
+  }
+  if (recoveryAborted(preContentTransportRecovery, signal)) {
+    if (pinnedResult) releaseRejectedQualityResponse(pinnedResult, pinnedResult);
+    return errorResponse(499, "Client disconnected");
+  }
+  if (pinnedResult) {
+    const accepted = await evaluatePinnedResponse({
+      body,
+      pinnedResult,
+      pinnedModel,
+      hasOtherTargets: comboTargets.length > 1,
+      clientRequestedStream,
+      config,
+      log,
+      preContentTransportRecovery,
+      signal,
+    });
+    return accepted;
+  }
   return null;
 }
 
@@ -237,6 +388,8 @@ export async function tryPinnedModelDispatch(args: {
   handleSingleModelWithTimeout: HandleSingleModel;
   log: ComboLogger;
   hiddenModelsByProvider?: HiddenModelsByProvider;
+  preContentTransportRecovery?: boolean;
+  signal?: AbortSignal | null;
 }): Promise<Response | null> {
   const {
     body,
@@ -259,13 +412,26 @@ export async function tryPinnedModelDispatch(args: {
   // combo's resolved targets (refs flattened) before honoring it. Only validate
   // when allCombos is authoritative (non-empty) so we can resolve combo-refs;
   // the auto-combo redirect path passes an empty list and keeps prior behavior.
+  const preContentTransportRecovery =
+    clientRequestedStream && args.preContentTransportRecovery === true;
+  const signal = args.signal;
+  if (recoveryAborted(preContentTransportRecovery, signal))
+    return errorResponse(499, "Client disconnected");
   const haveFullCombos = Array.isArray(allCombos) ? allCombos.length > 0 : !!allCombos;
-  const pinInCombo = resolveComboTargets(
+  // Eagerly resolve the combo's targets once (used for the pin-validity check AND
+  // #5501 template expansion). A non-authoritative allCombos (empty/missing)
+  // resolves to the combo's direct targets only — same semantics as the original
+  // `!haveFullCombos ||` short-circuit, without feeding `[]` to the nested resolver.
+  // #5501 also needs these targets eagerly for the combo system_message expansion;
+  // the release refactor threads `hiddenModelsByProvider` through the resolver so
+  // hidden models stay filtered on both the pin-validity and expansion paths.
+  const comboTargets = resolveComboTargets(
     combo,
-    haveFullCombos ? allCombos : null,
+    haveFullCombos ? allCombos : undefined,
     clampComboDepth(config.maxComboDepth),
     hiddenModelsByProvider
-  ).some((target) => target.modelStr === pinnedModel);
+  );
+  const pinInCombo = !haveFullCombos || comboTargets.some((t) => t.modelStr === pinnedModel);
   // Honor the pin only if it is still a combo target AND its provider is not
   // DURABLY down. Without the health gate a pin keeps routing a session to a
   // dead/credits-exhausted/throttled account forever (strategy bypassed, no
@@ -278,27 +444,19 @@ export async function tryPinnedModelDispatch(args: {
       "COMBO",
       `Bypassing strategy — routing directly to pinned context model: ${pinnedModel}`
     );
-    let pinnedResult: Response | null = null;
-    try {
-      pinnedResult = await handleSingleModelWithTimeout(body, pinnedModel, {
-        modelPinned: true,
-      } as SingleModelTarget);
-    } catch (pinErr) {
-      log.warn(
-        "COMBO",
-        `Pinned model ${pinnedModel} threw error: ${pinErr instanceof Error ? pinErr.message : String(pinErr)}, falling through to combo retry/fallback`
-      );
-    }
-    if (pinnedResult) {
-      const accepted = await evaluatePinnedResponse({
-        pinnedResult,
-        pinnedModel,
-        clientRequestedStream,
-        config,
-        log,
-      });
-      if (accepted) return accepted;
-    }
+    const honored = await dispatchHonoredPin({
+      body,
+      combo,
+      pinnedModel,
+      comboTargets,
+      config,
+      clientRequestedStream,
+      handleSingleModelWithTimeout,
+      log,
+      preContentTransportRecovery,
+      signal,
+    });
+    if (honored) return honored;
     // Fall through to the target iteration loop below — retries and sibling
     // models will be tried via the normal combo machinery.
   }
@@ -338,36 +496,115 @@ export async function tryFusionDispatch(args: {
   signal?: AbortSignal | null;
   apiKeyAllowedConnections?: string[] | null;
   hiddenModelsByProvider?: HiddenModelsByProvider;
+  perTargetAdmission?: PerTargetAdmissionHook | null;
+  deferContextOverflowWhenCompressible?: boolean;
+  compressionExclusions?: import("../compression/exclusions.ts").CompressionExclusions;
+  sourceFormat?: string | null;
+  endpointPath?: string | null;
+  requestHeaders?: Headers | Record<string, unknown> | null;
   runCombo: RunCombo;
 }): Promise<Response | null> {
   const { cfg, combo, config, strategy, log } = args;
   const configuredJudge = typeof cfg.judgeModel === "string" ? cfg.judgeModel : undefined;
+  const judgeFusionRequirements = deriveRequestCompatibilityRequirements(args.body);
+  // #3378: the judge stays in the original conversation (full history, including
+  // any image_url blocks) — a judge whose vision support cannot be confirmed is
+  // exactly as unsafe as an unconfirmed panel member (#8332). Drop it the same
+  // way an operator-hidden judge is dropped below, so fusion falls back to a
+  // (vision-confirmed) panel member instead of silently losing the image for
+  // the synthesis step.
+  const judgeLacksConfirmedVision =
+    judgeFusionRequirements.requiresVision &&
+    !!configuredJudge &&
+    getResolvedModelCapabilities(configuredJudge).supportsVision !== true;
   // The panel is filtered for hidden models by resolveComboTargets, but the
   // explicit judge is a bare string that never passes through it (#8878). Drop a
   // hidden judge so fusion falls back to a surviving panel member instead of
   // dispatching a model the operator hid.
   const judgeModel =
-    configuredJudge && !isComboModelVisible(configuredJudge, null, args.hiddenModelsByProvider)
-      ? undefined
-      : configuredJudge;
+    configuredJudge &&
+    !judgeLacksConfirmedVision &&
+    isComboModelVisible(configuredJudge, null, args.hiddenModelsByProvider)
+      ? configuredJudge
+      : undefined;
   const fusionTuning =
     cfg.fusionTuning && typeof cfg.fusionTuning === "object"
       ? (cfg.fusionTuning as FusionTuning)
       : undefined;
-  if (strategy !== "fusion" && (configuredJudge || fusionTuning)) {
+  const isFusion = getStrategyTraits(strategy).dispatchPrelude === "fusion";
+  if (!isFusion && (configuredJudge || fusionTuning)) {
     log.warn(
       "COMBO",
       `Combo "${combo.name}" sets config.judgeModel/fusionTuning but strategy is "${strategy}" — these fields are only consumed by the fusion strategy and will be ignored (#6455)`
     );
   }
-  if (strategy !== "fusion") return null;
+  if (!isFusion) return null;
 
-  const resolvedFusionTargets = resolveComboTargets(
+  let allResolvedFusionTargets = resolveComboTargets(
     combo,
     args.allCombos,
     clampComboDepth(config.maxComboDepth),
     args.hiddenModelsByProvider
   );
+  // Connection-aware expansion is opt-in. The fusion panel itself is
+  // keyed by model string below (`resolvedByModelStr` keeps ONE target per
+  // modelStr -- the first healthy connection), so the panel size is unchanged;
+  // only each member's connectionId becomes a vetted, non-exhausted account.
+  const expansionExclusions: PreDispatchExclusion[] = [];
+  allResolvedFusionTargets = await expandTargetsForAllStrategies({
+    strategy,
+    targets: allResolvedFusionTargets,
+    comboName: combo.name,
+    config: combo.config,
+    settings: args.settings as Record<string, unknown> | null | undefined,
+    log,
+    apiKeyAllowedConnectionIds: args.apiKeyAllowedConnections ?? null,
+    exclusions: expansionExclusions,
+  });
+  // Preserve transient expansion failures before the empty-panel validation.
+  if (allResolvedFusionTargets.length === 0) {
+    const coolingDown = buildAllTargetsCoolingDownResponse(expansionExclusions);
+    if (coolingDown) return coolingDown;
+  }
+  // #3378 (ported from upstream decolua/9router): every non-fusion combo
+  // strategy runs candidates through filterTargetsByRequestCompatibility before
+  // dispatch, which excludes a target whose vision support is explicitly false
+  // for an image-bearing request (#17289 relaxed #8332: unknown metadata is now
+  // tried after confirmed targets). Fusion resolved its panel via the
+  // raw target list and skipped that filter entirely, so a panel member with an
+  // unrecognized model id (capability lookup misses -> supportsVision !== true)
+  // still received the unmodified image body while the panel silently lost a
+  // "confirmed vision" voice. Fusion deliberately keeps the stricter #8332 rule
+  // (isVisionIncompatibleTarget: unknown is excluded too): a panel fan-out has no
+  // "last resort" tier, so the panel only receives targets with confirmed vision.
+  const fusionRequirements = judgeFusionRequirements;
+  const resolvedFusionTargets = fusionRequirements.requiresVision
+    ? allResolvedFusionTargets.filter(
+        (target) => !isVisionIncompatibleTarget(target, fusionRequirements)
+      )
+    : allResolvedFusionTargets;
+  if (fusionRequirements.requiresVision && resolvedFusionTargets.length === 0) {
+    log.warn(
+      "COMBO",
+      `Combo "${combo.name}" fusion panel has no target with confirmed vision support for this image request — every candidate was excluded (#3378)`
+    );
+    return errorResponseWithComboDiagnostics(
+      400,
+      `No target in combo ${combo.name} has confirmed vision support for this image request`,
+      {
+        poolSize: allResolvedFusionTargets.length,
+        attempted: 0,
+        excluded: allResolvedFusionTargets.map((target) => ({
+          provider: target.provider,
+          model: target.modelStr,
+          reason: "vision",
+        })),
+        attemptOrder: [],
+        terminalReason: "capability_mismatch",
+      },
+      { code: "capability_mismatch", type: "invalid_request_error" }
+    );
+  }
   // extractFusionPanelSpec only understands model strings / combo refs, so the
   // resolved targets have to be flattened before it runs. Keep them indexed so
   // the panel can be rehydrated below — dispatching the bare strings strips
@@ -376,8 +613,19 @@ export async function tryFusionDispatch(args: {
   for (const target of resolvedFusionTargets) {
     if (!resolvedByModelStr.has(target.modelStr)) resolvedByModelStr.set(target.modelStr, target);
   }
+  // Deduplicate targets by stepId / modelStr so panel size does not inflate
+  // when models expand across multiple connections.
+  const seenPanelKeys = new Set<string>();
+  const distinctTargets: typeof resolvedFusionTargets = [];
+  for (const target of resolvedFusionTargets) {
+    const key = target.stepId ?? target.modelStr;
+    if (!seenPanelKeys.has(key)) {
+      seenPanelKeys.add(key);
+      distinctTargets.push(target);
+    }
+  }
   const { panel: fusionPanel, comboRefUnits } = extractFusionPanelSpec(
-    resolvedFusionTargets.map((target) => target.modelStr),
+    distinctTargets.map((target) => target.modelStr),
     combo.name,
     null
   );
@@ -407,6 +655,7 @@ export async function tryFusionDispatch(args: {
     handleSingleModel: fusionHandleSingleModel,
     log,
     comboName: combo.name,
+    perTargetAdmission: args.perTargetAdmission,
     judgeModel,
     tuning: fusionTuning,
   });
@@ -424,6 +673,8 @@ export async function tryPipelineDispatch(args: {
   combo: ComboLike;
   config: ComboSetupConfig;
   strategy: string;
+  settings?: Record<string, unknown> | null;
+  apiKeyAllowedConnections?: string[] | null;
   allCombos?: ComboCollectionLike;
   handleSingleModelWithTimeout: HandleSingleModel;
   log: ComboLogger;
@@ -434,18 +685,64 @@ export async function tryPipelineDispatch(args: {
     combo,
     config,
     strategy,
+    settings,
+    apiKeyAllowedConnections,
     allCombos,
     handleSingleModelWithTimeout,
     log,
     hiddenModelsByProvider,
   } = args;
-  if (strategy !== "pipeline") return null;
-  const pipelineSteps: PipelineStep[] = resolveComboTargets(
+  if (getStrategyTraits(strategy).dispatchPrelude !== "pipeline") return null;
+  const resolvedTargets = resolveComboTargets(
     combo,
     allCombos,
     clampComboDepth(config.maxComboDepth),
     hiddenModelsByProvider
-  ).map((target) => ({ target, prompt: target.prompt }));
+  );
+  const expansionExclusions: PreDispatchExclusion[] = [];
+  const expanded = await expandTargetsForAllStrategies({
+    strategy,
+    targets: resolvedTargets,
+    comboName: combo.name,
+    config: combo.config,
+    settings: settings as Record<string, unknown> | null | undefined,
+    log,
+    apiKeyAllowedConnectionIds: apiKeyAllowedConnections ?? null,
+    exclusions: expansionExclusions,
+  });
+  // An empty configured chain keeps its existing validation error; a chain
+  // emptied by cooldowns carries the same recovery contract as other combos.
+  if (expanded.length === 0) {
+    const coolingDown = buildAllTargetsCoolingDownResponse(expansionExclusions);
+    if (coolingDown) return coolingDown;
+  }
+  // Pipeline: each stage is one step. If a step expanded to multiple connections,
+  // keep the first healthy connection for that stage.
+  const seenSteps = new Set<string>();
+  const pipelineTargets: typeof expanded = [];
+  for (const target of expanded) {
+    const key = target.stepId ?? target.modelStr;
+    if (!seenSteps.has(key)) {
+      seenSteps.add(key);
+      pipelineTargets.push(target);
+    }
+  }
+  const pipelineSteps: PipelineStep[] = pipelineTargets.map((target) => ({
+    target,
+    prompt: target.prompt,
+  }));
+  const agenticConfig = (combo.config as Record<string, unknown> | null | undefined)
+    ?.agenticOrchestration as AgenticOrchestrationConfig | undefined;
+  if (agenticConfig?.enabled) {
+    return handleAgenticPipelineChat({
+      body,
+      steps: pipelineSteps,
+      handleSingleModel: handleSingleModelWithTimeout,
+      log,
+      comboName: combo.name,
+      config: agenticConfig,
+    });
+  }
   return handlePipelineChat({
     body,
     steps: pipelineSteps,
@@ -479,9 +776,10 @@ async function orderRuntimeUnits(args: {
   settings?: Record<string, unknown> | null;
 }): Promise<RuntimeUnitOrdering> {
   const { strategy, executeModeUnits, combo, config, settings } = args;
+  const { stickyPin, runtimeUnitOrder } = getStrategyTraits(strategy);
   let runtimeUnits = executeModeUnits;
   let unitExecutionStrategy = strategy;
-  if (strategy === "weighted") {
+  if (stickyPin === "weighted") {
     const stickyLimit = clampStickyWeightedTargetLimit(
       (config as Record<string, unknown>).stickyWeightedLimit
     );
@@ -497,8 +795,8 @@ async function orderRuntimeUnits(args: {
       unitExecutionStrategy = "priority";
     }
   }
-  if (strategy === "random") runtimeUnits = fisherYatesShuffle([...runtimeUnits]);
-  if (strategy === "strict-random") {
+  if (runtimeUnitOrder === "shuffle") runtimeUnits = fisherYatesShuffle([...runtimeUnits]);
+  if (runtimeUnitOrder === "deck") {
     const key = await getNextFromDeck(
       `combo:${combo.name}`,
       runtimeUnits.map((unit) => unit.executionKey)
@@ -511,7 +809,7 @@ async function orderRuntimeUnits(args: {
   }
   let runtimeStickyLimit: number | null = null;
   let runtimeStickyTargets: ResolvedComboUnit[] = runtimeUnits;
-  if (strategy === "round-robin") {
+  if (stickyPin === "round-robin") {
     const perComboStickyLimit = (config as Record<string, unknown>).stickyRoundRobinLimit;
     runtimeStickyLimit = resolveComboStickyRoundRobinLimit(
       perComboStickyLimit,
@@ -561,6 +859,12 @@ export async function tryRuntimeUnitDispatch(args: {
   signal?: AbortSignal | null;
   apiKeyAllowedConnections?: string[] | null;
   hiddenModelsByProvider?: HiddenModelsByProvider;
+  perTargetAdmission?: PerTargetAdmissionHook | null;
+  deferContextOverflowWhenCompressible?: boolean;
+  compressionExclusions?: import("../compression/exclusions.ts").CompressionExclusions;
+  sourceFormat?: string | null;
+  endpointPath?: string | null;
+  requestHeaders?: Headers | Record<string, unknown> | null;
   runCombo: RunCombo;
 }): Promise<Response | null> {
   const { body, combo, config, strategy, allCombos, log, settings } = args;
@@ -578,16 +882,11 @@ export async function tryRuntimeUnitDispatch(args: {
         )
       : [];
   const hasExecutableComboRef = executeModeUnits.some((unit) => unit.kind === "combo-ref");
-  const simpleExecuteStrategies = new Set([
-    "priority",
-    "round-robin",
-    "random",
-    "strict-random",
-    "weighted",
-    "fill-first",
-  ]);
-
-  if (!hasExecutableComboRef || !simpleExecuteStrategies.has(strategy)) return null;
+  // Only the simple execute strategies (priority / round-robin / random / strict-random /
+  // weighted / fill-first) support execute-mode runtime units — every other strategy has
+  // `runtimeUnitOrder: "unsupported"` in the strategy registry.
+  const runtimeUnitsSupported = getStrategyTraits(strategy).runtimeUnitOrder !== "unsupported";
+  if (!hasExecutableComboRef || !runtimeUnitsSupported) return null;
 
   const ordering = await orderRuntimeUnits({
     strategy,
@@ -619,6 +918,7 @@ export async function tryRuntimeUnitDispatch(args: {
     nesting: nestingContext,
     baseOptions: buildBaseOptions(args),
     runCombo: args.runCombo,
+    hiddenModelsByProvider: args.hiddenModelsByProvider,
   });
   recordRuntimeUnitStickySuccess({
     strategy,
@@ -644,7 +944,8 @@ function recordRuntimeUnitStickySuccess(args: {
   stickyTargets: ResolvedComboUnit[];
 }): void {
   const { strategy, combo, config, execution, stickyLimit, stickyTargets } = args;
-  if (strategy === "weighted" && execution.response.ok && execution.unit) {
+  const { stickyPin } = getStrategyTraits(strategy);
+  if (stickyPin === "weighted" && execution.response.ok && execution.unit) {
     const weightedLimit = clampStickyWeightedTargetLimit(
       (config as Record<string, unknown>).stickyWeightedLimit
     );
@@ -652,7 +953,7 @@ function recordRuntimeUnitStickySuccess(args: {
       recordStickyWeightedSuccess(combo.name, execution.unit.executionKey, weightedLimit);
   }
   if (
-    strategy === "round-robin" &&
+    stickyPin === "round-robin" &&
     execution.response.ok &&
     execution.unit &&
     stickyLimit &&
