@@ -336,6 +336,7 @@ const COMPETITIVE_AGENT_PROMPT_PATTERNS: RegExp[] = [
   /\bbuilt on anthropic's claude agent sdk\b[^\n]*/i,
   /\byou are claude code\b[^\n]*/i,
   /\byou are an ai assistant created by anthropic\b[^\n]*/i,
+  /\byou are hermes agent\b[^.\n]*(?:\.\s*|$)/i,
 ];
 
 /**

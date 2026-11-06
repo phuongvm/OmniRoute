@@ -265,11 +265,13 @@ export function openaiToClaudeRequest(
     // Clients like OpenCode send reasoning_effort via @ai-sdk/openai-compatible
     const requestedEffort = String(body.reasoning_effort).toLowerCase();
     const normalizedEffort =
-      requestedEffort === "max" && !supportsClaudeMaxEffort(model)
-        ? "high"
-        : requestedEffort === "xhigh" && !supportsXHighEffort("claude", model)
+      requestedEffort === "minimal"
+        ? "low"
+        : requestedEffort === "max" && !supportsClaudeMaxEffort(model)
           ? "high"
-          : requestedEffort;
+          : requestedEffort === "xhigh" && !supportsXHighEffort("claude", model)
+            ? "high"
+            : requestedEffort;
     if (isAdaptiveThinkingOnly(model)) {
       // Opus 4.7+/Fable 5 removed manual extended thinking: a fixed `budget_tokens`
       // (or `type:"enabled"`) is a hard 400. Steer EVERY level via adaptive +

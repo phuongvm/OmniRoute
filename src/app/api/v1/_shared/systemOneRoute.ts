@@ -18,8 +18,10 @@ import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import {
   isKeyScopeBlockedCredentials,
+  keylessProviderRejection,
   keyScopeBlockedResponse,
   resolveKeyConnectionScope,
+  withoutKeyScopeBlocked,
 } from "@/sse/services/keyConnectionScope";
 import { v1SystemOneSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -48,6 +50,99 @@ export function systemOneModelsGet(pathname: string) {
     });
 }
 
+export type CredentialLookupFn = typeof getProviderCredentialsWithQuotaPreflight;
+
+export async function resolveSystemOneRouteAuth(
+  target: NonNullable<ReturnType<typeof resolveSystemOneTarget>>,
+  allowedConnections: string[] | null,
+  lookupCredentials: CredentialLookupFn = getProviderCredentialsWithQuotaPreflight
+): Promise<{
+  credentials: SystemOneCredentials | null;
+  fallbackCredentials: SystemOneCredentials | null;
+  rawCredentials: Awaited<ReturnType<CredentialLookupFn>>;
+  rejection: Response | null;
+}> {
+  if (target.noAuth) {
+    // GHSA-3w2r / #9057: a connection-scoped key reaches a keyless local provider
+    // only when its allowlist explicitly includes `noauth` or an in-scope connection
+    // serves the provider.
+    const keylessRejection = await keylessProviderRejection(
+      target.provider,
+      allowedConnections,
+      () => lookupCredentials(target.provider, null, allowedConnections)
+    );
+    if (keylessRejection) {
+      return {
+        credentials: null,
+        fallbackCredentials: null,
+        rawCredentials: null,
+        rejection: keylessRejection,
+      };
+    }
+
+    let fallbackCredentials: SystemOneCredentials | null = null;
+    const fallbackCandidate = target.candidates?.find((c) => !c.noAuth);
+    if (fallbackCandidate) {
+      try {
+        const rawFallback = await lookupCredentials(
+          fallbackCandidate.provider,
+          null,
+          allowedConnections
+        );
+        const usableFallback = withoutKeyScopeBlocked(rawFallback);
+        if (usableFallback && !isAllRateLimitedCredentials(usableFallback)) {
+          fallbackCredentials = usableFallback as SystemOneCredentials;
+        }
+      } catch {
+        fallbackCredentials = null;
+      }
+    }
+
+    return {
+      credentials: null,
+      fallbackCredentials,
+      rawCredentials: null,
+      rejection: null,
+    };
+  }
+
+  const rawCredentials = await lookupCredentials(target.provider, null, allowedConnections);
+  if (!rawCredentials) {
+    return {
+      credentials: null,
+      fallbackCredentials: null,
+      rawCredentials: null,
+      rejection: errorResponse(
+        HTTP_STATUS.BAD_REQUEST,
+        `No active credentials for provider: ${target.provider}`
+      ),
+    };
+  }
+  if (isKeyScopeBlockedCredentials(rawCredentials)) {
+    return {
+      credentials: null,
+      fallbackCredentials: null,
+      rawCredentials: null,
+      rejection: keyScopeBlockedResponse(target.provider, rawCredentials),
+    };
+  }
+  if (isAllRateLimitedCredentials(rawCredentials)) {
+    return {
+      credentials: null,
+      fallbackCredentials: null,
+      rawCredentials: null,
+      rejection: rateLimitedProviderResponse(target.provider, rawCredentials),
+    };
+  }
+
+  return {
+    credentials: rawCredentials as SystemOneCredentials,
+    fallbackCredentials: null,
+    rawCredentials,
+    rejection: null,
+  };
+}
+
 async function postHandler(request: Request): Promise<Response> {
   let rawBody: unknown;
   try {
@@ -68,7 +163,7 @@ async function postHandler(request: Request): Promise<Response> {
     return errorResponse(
       HTTP_STATUS.BAD_REQUEST,
       `Unknown decisions model: ${model ?? "(missing)"}. Use "typesafe/<model>", ` +
-        `a bare jev-* alias, or "openrouter/<vendor>/<model>" for OpenRouter-hosted decisions models.`
+        `"laya/<model>", a bare jev-* alias, or "openrouter/<vendor>/<model>" for OpenRouter-hosted decisions models.`
     );
   }
 
@@ -80,35 +175,20 @@ async function postHandler(request: Request): Promise<Response> {
   const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
   if (scope.rejection) return scope.rejection;
 
-  const credentials = await getProviderCredentialsWithQuotaPreflight(
-    target.provider,
-    null,
-    scope.allowedConnections
-  );
-  if (!credentials) {
-    return errorResponse(
-      HTTP_STATUS.BAD_REQUEST,
-      `No active credentials for provider: ${target.provider}`
-    );
-  }
-  if (isKeyScopeBlockedCredentials(credentials)) {
-    return keyScopeBlockedResponse(target.provider, credentials);
-  }
-  if (isAllRateLimitedCredentials(credentials)) {
-    return rateLimitedProviderResponse(target.provider, credentials);
-  }
+  const auth = await resolveSystemOneRouteAuth(target, scope.allowedConnections);
+  if (auth.rejection) return auth.rejection;
 
   const response = await handleSystemOneProxy({
     path: new URL(request.url).pathname,
     target,
     body,
-    // The key-scope-blocked and all-rate-limited sentinels were refused above;
-    // what is left is a real credential record.
-    credentials: credentials as SystemOneCredentials,
+    // For noAuth targets (local Laya), credentials is null and no Authorization header is sent.
+    credentials: auth.credentials,
+    fallbackCredentials: auth.fallbackCredentials,
     requestedModel: model ?? null,
   });
-  if (response.ok) {
-    await clearRecoveredProviderState(credentials);
+  if (response.ok && auth.rawCredentials && !target.noAuth) {
+    await clearRecoveredProviderState(auth.rawCredentials);
   }
   return response;
 }

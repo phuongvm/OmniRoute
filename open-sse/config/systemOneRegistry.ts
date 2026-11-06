@@ -22,15 +22,70 @@ export const OPENROUTER_DECISIONS_PROVIDER_ID = "openrouter";
 export const OPENROUTER_DECISIONS_BASE_URL = "https://openrouter.ai";
 export const OPENROUTER_DECISIONS_URL = `${OPENROUTER_DECISIONS_BASE_URL}/api/alpha/decisions`;
 
-export type SystemOneBackend = "typesafe" | "openrouter";
+export const LAYA_SYSTEMONE_PROVIDER_ID = "laya";
+export const DEFAULT_LAYA_SYSTEMONE_URL = "http://192.168.100.130:8000/v1/systemone";
+export const LAYA_SYSTEMONE_MODELS = [
+  "laya-auto",
+  "english",
+  "multilingual",
+  "typed-decisions",
+] as const;
+export type LayaSystemOneModel = (typeof LAYA_SYSTEMONE_MODELS)[number];
+const LAYA_ALLOWED_MODEL_SET: ReadonlySet<string> = new Set<string>(LAYA_SYSTEMONE_MODELS);
 
-export interface SystemOneTarget {
+export const OPENCODE_ZEN_SYSTEMONE_PROVIDER_ID = "opencode-zen";
+export const DEFAULT_OPENCODE_ZEN_SYSTEMONE_URL = "https://opencode.ai/zen/v1/systemone";
+export const DEFAULT_LAYA_FALLBACK_MODEL = "jev-1.13-free";
+export const DEFAULT_LAYA_TIMEOUT_MS = 5000;
+export const LAYA_FAILOVER_STATUSES = [502, 503, 504] as const;
+
+export type SystemOneBackend = "typesafe" | "openrouter" | "laya" | "opencode-zen";
+
+export interface SystemOneCandidate {
   backend: SystemOneBackend;
-  /** Provider id used for credential lookup ("typesafe" | "openrouter"). */
   provider: string;
-  /** Model id forwarded upstream (gateway prefix stripped). */
   upstreamModel: string;
   upstreamUrl: string;
+  /** When true, no stored DB credential is required and no Authorization header is sent. */
+  noAuth?: boolean;
+  /** Optional public/free-lane token used when no stored credential is supplied. */
+  defaultToken?: string;
+  /** HTTP status codes from this candidate that trigger failover to the next candidate. */
+  failoverStatuses?: readonly number[];
+}
+
+export interface SystemOneTarget extends SystemOneCandidate {
+  /** Ordered failover ladder (index 0 is primary, index 1+ are fallback rungs). */
+  candidates?: SystemOneCandidate[];
+}
+
+export function getLayaSystemOneUrl(): string {
+  const configured = process.env.LAYA_SYSTEMONE_URL?.trim();
+  return configured || DEFAULT_LAYA_SYSTEMONE_URL;
+}
+
+export function getLayaFallbackCandidate(): SystemOneCandidate {
+  const rawFallback = process.env.LAYA_FALLBACK_MODEL?.trim() || "opencode-zen/jev-1.13-free";
+  const slashIdx = rawFallback.indexOf("/");
+  let upstreamModel = DEFAULT_LAYA_FALLBACK_MODEL;
+  if (slashIdx > 0) {
+    const prefix = rawFallback.slice(0, slashIdx).trim();
+    const suffix = rawFallback.slice(slashIdx + 1).trim();
+    if (prefix === OPENCODE_ZEN_SYSTEMONE_PROVIDER_ID && /^[A-Za-z0-9._:-]+$/.test(suffix)) {
+      upstreamModel = suffix;
+    }
+  } else if (/^[A-Za-z0-9._:-]+$/.test(rawFallback)) {
+    upstreamModel = rawFallback;
+  }
+  const upstreamUrl =
+    process.env.OPENCODE_ZEN_SYSTEMONE_URL?.trim() || DEFAULT_OPENCODE_ZEN_SYSTEMONE_URL;
+  return {
+    backend: "opencode-zen",
+    provider: OPENCODE_ZEN_SYSTEMONE_PROVIDER_ID,
+    upstreamModel,
+    upstreamUrl,
+    defaultToken: "public",
+  };
 }
 
 /**
@@ -39,9 +94,9 @@ export interface SystemOneTarget {
  * `openrouter/…` explicitly picks the OpenRouter alpha decisions endpoint and
  * may name any decisions-capable vendor id (`typesafe/jev-1.13`,
  * `inception/mercury-decide:free`, …). `typesafe/…` and bare `jev-*` aliases
- * route natively; versioned aliases (jev-1.13, jev-1.14, …) are forwarded
- * verbatim even though only `jev-latest`/`jev-preview` are advertised —
- * upstream accepts unlisted jev-* versions (#13987 Part 1).
+ * route natively; `laya/…` routes only the four approved models in
+ * `LAYA_SYSTEMONE_MODELS` to the local Laya SystemOne server (`noAuth: true`)
+ * with an ordered failover ladder to `opencode-zen/jev-1.13-free`.
  */
 export function resolveSystemOneTarget(model: string | undefined): SystemOneTarget | null {
   const trimmed = (model ?? "").trim();
@@ -51,6 +106,25 @@ export function resolveSystemOneTarget(model: string | undefined): SystemOneTarg
       provider: TYPESAFE_SYSTEMONE_PROVIDER_ID,
       upstreamModel: trimmed || TYPESAFE_SYSTEMONE_DEFAULT_MODEL,
       upstreamUrl: TYPESAFE_SYSTEMONE_URL,
+    };
+  }
+  if (trimmed.startsWith("laya/")) {
+    const layaModel = trimmed.slice("laya/".length).trim();
+    if (!LAYA_ALLOWED_MODEL_SET.has(layaModel)) {
+      return null;
+    }
+    const primary: SystemOneCandidate = {
+      backend: "laya",
+      provider: LAYA_SYSTEMONE_PROVIDER_ID,
+      upstreamModel: layaModel,
+      upstreamUrl: getLayaSystemOneUrl(),
+      noAuth: true,
+      failoverStatuses: LAYA_FAILOVER_STATUSES,
+    };
+    const fallback = getLayaFallbackCandidate();
+    return {
+      ...primary,
+      candidates: [primary, fallback],
     };
   }
   if (trimmed.startsWith("typesafe/")) {

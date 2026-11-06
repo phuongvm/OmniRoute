@@ -19,7 +19,12 @@ import { errorResponse } from "../utils/error.ts";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { saveCallLog } from "@/lib/usageDb";
-import type { SystemOneTarget } from "../config/systemOneRegistry.ts";
+import {
+  DEFAULT_LAYA_TIMEOUT_MS,
+  LAYA_FAILOVER_STATUSES,
+  type SystemOneCandidate,
+  type SystemOneTarget,
+} from "../config/systemOneRegistry.ts";
 
 export interface SystemOneCredentials {
   apiKey?: string | null;
@@ -36,6 +41,12 @@ export interface SystemOneProxyOptions {
     questions?: unknown;
   } & Record<string, unknown>;
   credentials: SystemOneCredentials | null;
+  /** Optional credentials for fallback rungs (e.g., opencode-zen). */
+  fallbackCredentials?: SystemOneCredentials | null;
+  /** Optional provider-keyed credential map for multi-rung ladders. */
+  credentialsByProvider?: Record<string, SystemOneCredentials | null | undefined>;
+  /** Optional per-attempt timeout in milliseconds for noAuth/local candidates. */
+  timeoutMs?: number;
   /** Client-requested model id (for logs when upstream reports none). */
   requestedModel?: string | null;
   fetchImpl?: typeof fetch;
@@ -81,25 +92,53 @@ function buildSuccessResponse(
   return new Response(JSON.stringify(parsed), { status: 200, headers });
 }
 
-function postDecision(options: SystemOneProxyOptions, token: string): Promise<Response> {
+async function postDecision(
+  options: SystemOneProxyOptions,
+  candidate: SystemOneCandidate,
+  token: string | null
+): Promise<Response> {
   const fetchImpl: typeof fetch = options.fetchImpl ?? fetch;
-  return fetchImpl(options.target.upstreamUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      model: options.target.upstreamModel,
-      state: options.body.state,
-      questions: options.body.questions,
-    }),
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (!candidate.noAuth && token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const timeoutMs =
+    typeof options.timeoutMs === "number"
+      ? options.timeoutMs
+      : candidate.noAuth
+        ? Number(process.env.LAYA_SYSTEMONE_TIMEOUT_MS) || DEFAULT_LAYA_TIMEOUT_MS
+        : 0;
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timer =
+    controller && timeoutMs > 0
+      ? setTimeout(
+          () => controller.abort(new Error(`Upstream timeout after ${timeoutMs}ms`)),
+          timeoutMs
+        )
+      : null;
+  try {
+    return await fetchImpl(candidate.upstreamUrl, {
+      method: "POST",
+      headers,
+      ...(controller ? { signal: controller.signal } : {}),
+      body: JSON.stringify({
+        model: candidate.upstreamModel,
+        state: options.body.state,
+        questions: options.body.questions,
+      }),
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function logDecisionCall(
   options: SystemOneProxyOptions,
+  candidate: SystemOneCandidate,
+  connectionId: string | null,
   outcome: {
     status: number;
     ok: boolean;
@@ -114,63 +153,134 @@ function logDecisionCall(
     path: options.path,
     status: outcome.status,
     model: outcome.model,
-    provider: options.target.provider,
+    provider: candidate.provider,
     duration: Date.now() - outcome.startTime,
     tokens: {
       prompt_tokens: outcome.usage?.input_tokens ?? 0,
       completion_tokens: outcome.usage?.output_tokens ?? 0,
     },
-    connectionId: options.credentials?.connectionId || null,
+    connectionId,
     ...(outcome.ok ? {} : { error: outcome.error }),
-  }).catch(() => {});
+  }).catch((err: unknown) => {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.warn(`[SYSTEMONE] saveCallLog warning for ${candidate.provider}: ${detail}`);
+  });
 }
 
 function resolveAnsweredModel(
   parsed: SystemOneUpstreamResponse | null,
-  options: SystemOneProxyOptions
+  options: SystemOneProxyOptions,
+  candidate: SystemOneCandidate
 ): string {
   const upstreamModel = typeof parsed?.model === "string" ? parsed.model : "";
-  return upstreamModel || options.requestedModel || options.target.provider;
+  return upstreamModel || options.requestedModel || candidate.provider;
+}
+
+function resolveCandidateToken(
+  candidate: SystemOneCandidate,
+  index: number,
+  options: SystemOneProxyOptions
+): { token: string | null; connectionId: string | null } {
+  if (candidate.noAuth) {
+    return { token: null, connectionId: null };
+  }
+  const byProvider = options.credentialsByProvider?.[candidate.provider];
+  const creds =
+    byProvider !== undefined
+      ? byProvider
+      : index === 0
+        ? options.credentials
+        : (options.fallbackCredentials ?? null);
+  const token = creds?.apiKey || creds?.accessToken || candidate.defaultToken || null;
+  return { token, connectionId: creds?.connectionId || null };
+}
+
+function shouldFailoverOnStatus(candidate: SystemOneCandidate, status: number, hasNext: boolean): boolean {
+  if (!hasNext) return false;
+  const statuses = candidate.failoverStatuses ?? (candidate.noAuth ? LAYA_FAILOVER_STATUSES : []);
+  return statuses.includes(status);
 }
 
 export async function handleSystemOneProxy(options: SystemOneProxyOptions): Promise<Response> {
-  const startTime = Date.now();
-  const provider = options.target.provider;
-  const token = options.credentials?.apiKey || options.credentials?.accessToken;
+  const candidates: SystemOneCandidate[] =
+    Array.isArray(options.target.candidates) && options.target.candidates.length > 0
+      ? options.target.candidates
+      : [options.target];
 
-  if (!token) {
-    return errorResponse(401, `No active credentials for provider: ${provider}`);
+  const primary = candidates[0];
+  const primaryAuth = resolveCandidateToken(primary, 0, options);
+  if (!primary.noAuth && !primaryAuth.token) {
+    return errorResponse(401, `No active credentials for provider: ${primary.provider}`);
   }
 
-  try {
-    const res = await postDecision(options, token);
-    const text = await res.text();
-    const parsed = parseUpstreamBody(text);
-    const usage = res.ok ? parsed?.usage : undefined;
-    const answeredModel = resolveAnsweredModel(parsed, options);
-    const upstreamError = upstreamErrorMessage(parsed);
+  let lastFailureResponse: Response | null = null;
+  let lastErrorMessage = "";
 
-    logDecisionCall(options, {
-      status: res.status,
-      ok: res.ok,
-      model: answeredModel,
-      usage,
-      error: upstreamError || text.slice(0, 500),
-      startTime,
-    });
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    const hasNext = i < candidates.length - 1;
+    const startTime = Date.now();
+    const { token, connectionId } = resolveCandidateToken(candidate, i, options);
 
-    if (!res.ok) {
-      return errorResponse(res.status, upstreamError || `Provider returned HTTP ${res.status}`);
+    if (!candidate.noAuth && !token) {
+      lastFailureResponse = errorResponse(
+        401,
+        `No active credentials for provider: ${candidate.provider}`
+      );
+      continue;
     }
 
-    return buildSuccessResponse(parsed, {
-      provider,
-      model: answeredModel,
-      cost: usage?.cost,
-      startTime,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return errorResponse(500, `System One request failed: ${message}`);
+    try {
+      const res = await postDecision(options, candidate, token);
+      const text = await res.text();
+      const parsed = parseUpstreamBody(text);
+      const usage = res.ok ? parsed?.usage : undefined;
+      const answeredModel = resolveAnsweredModel(parsed, options, candidate);
+      const upstreamError = upstreamErrorMessage(parsed);
+
+      logDecisionCall(options, candidate, connectionId, {
+        status: res.status,
+        ok: res.ok,
+        model: answeredModel,
+        usage,
+        error: upstreamError || text.slice(0, 500),
+        startTime,
+      });
+
+      if (!res.ok) {
+        if (shouldFailoverOnStatus(candidate, res.status, hasNext)) {
+          lastErrorMessage = upstreamError || `Provider ${candidate.provider} returned HTTP ${res.status}`;
+          continue;
+        }
+        return errorResponse(res.status, upstreamError || `Provider returned HTTP ${res.status}`);
+      }
+
+      return buildSuccessResponse(parsed, {
+        provider: candidate.provider,
+        model: answeredModel,
+        cost: usage?.cost,
+        startTime,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      lastErrorMessage = message;
+      logDecisionCall(options, candidate, connectionId, {
+        status: 502,
+        ok: false,
+        model: options.requestedModel || candidate.upstreamModel,
+        usage: undefined,
+        error: message,
+        startTime,
+      });
+      if (hasNext) {
+        continue;
+      }
+      return errorResponse(500, `System One request failed: ${message}`);
+    }
   }
+
+  if (lastFailureResponse) {
+    return lastFailureResponse;
+  }
+  return errorResponse(500, `System One request failed: ${lastErrorMessage || "All candidates failed"}`);
 }
